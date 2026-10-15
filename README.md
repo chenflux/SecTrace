@@ -82,4 +82,4 @@ build.bat
 
 ## License
 
-MIT
+GPL-2.0 (见 [LICENSE](LICENSE))
