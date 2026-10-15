@@ -1,0 +1,23 @@
+# 编译产物
+outputs/
+*.exe
+*.syso
+
+# Go
+*.test
+*.out
+vendor/
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统文件
+Thumbs.db
+.DS_Store
+
+# 临时文件
+*.tmp
+*.log

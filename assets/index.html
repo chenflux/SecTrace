@@ -1,0 +1,1086 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>SecTrace</title>
+<style>
+:root {
+  --bg: #0a0e14;
+  --bg-2: #0f141b;
+  --bg-3: #141b25;
+  --panel: #1a2230;
+  --border: #1f2a3a;
+  --border-hi: #2d3a52;
+  --text: #c8d0db;
+  --text-dim: #7a8595;
+  --text-bright: #e8eef7;
+  --accent: #00d4ff;
+  --accent-dim: #007a99;
+  --green: #00ff9d;
+  --green-dim: #007a4d;
+  --yellow: #ffb547;
+  --red: #ff5577;
+  --purple: #b97aff;
+  --row-hover: #1d2738;
+  --row-alt: #11171f;
+  --grid: rgba(0, 212, 255, 0.04);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg);
+  overflow: hidden;
+  user-select: none;
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 40px 40px;
+  z-index: 0;
+}
+
+#app {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto auto auto auto 1fr auto;
+  height: 100vh;
+  z-index: 1;
+}
+
+/* 标题栏 */
+.titlebar {
+  background: linear-gradient(180deg, #11171f 0%, #0a0e14 100%);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text-bright);
+  letter-spacing: 0.5px;
+}
+
+.brand .logo {
+  width: 22px; height: 22px;
+  position: relative;
+  display: flex; align-items: center; justify-content: center;
+}
+
+.brand .logo svg { width: 100%; height: 100%; }
+
+.brand .ver {
+  color: var(--text-dim);
+  font-weight: normal;
+  font-size: 11px;
+  margin-left: -4px;
+  font-family: "Consolas", monospace;
+}
+
+.indicators {
+  display: flex;
+  gap: 14px;
+  margin-left: auto;
+  font-size: 11px;
+  font-family: "Consolas", monospace;
+  color: var(--text-dim);
+}
+
+.indicators .item { display: flex; align-items: center; gap: 6px; }
+.indicators .dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+  animation: pulse 2s ease-in-out infinite;
+}
+.indicators .dot.warn { background: var(--yellow); box-shadow: 0 0 8px var(--yellow); }
+.indicators .dot.err  { background: var(--red); box-shadow: 0 0 8px var(--red); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* 标签栏 (segmented) */
+.tabs {
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  padding: 0 12px;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  overflow-x: auto;
+}
+
+.tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim);
+  padding: 10px 16px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: inherit;
+  white-space: nowrap;
+  position: relative;
+}
+
+.tab:hover { color: var(--text); background: var(--bg-3); }
+
+.tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background: var(--bg-3);
+  text-shadow: 0 0 6px rgba(0, 212, 255, 0.5);
+}
+
+.tab .ico { font-size: 14px; }
+.tab .count {
+  font-size: 10px;
+  background: var(--border-hi);
+  color: var(--text);
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-family: "Consolas", monospace;
+}
+.tab.active .count { background: var(--accent-dim); color: var(--bg); font-weight: 600; }
+
+/* 工具栏 */
+.toolbar {
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tb-input {
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 10px;
+  font-size: 12px;
+  font-family: "Consolas", monospace;
+  border-radius: 3px;
+  outline: none;
+  width: 240px;
+}
+.tb-input:focus { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-dim); }
+
+.tb-select {
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 8px;
+  font-size: 12px;
+  border-radius: 3px;
+  outline: none;
+  cursor: pointer;
+}
+
+.tb-btn {
+  background: var(--bg-3);
+  border: 1px solid var(--border-hi);
+  color: var(--text);
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  transition: all 0.15s;
+  font-family: inherit;
+}
+.tb-btn:hover { background: var(--border); border-color: var(--accent); color: var(--accent); }
+.tb-btn:active { transform: translateY(1px); }
+.tb-btn.primary { background: var(--accent-dim); border-color: var(--accent); color: var(--bg); font-weight: 600; }
+.tb-btn.primary:hover { background: var(--accent); color: var(--bg); }
+
+.tb-spacer { flex: 1; }
+
+.tb-stats {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: "Consolas", monospace;
+  padding: 0 6px;
+}
+.tb-stats b { color: var(--green); font-weight: 600; }
+
+.tb-hint {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-family: "Consolas", monospace;
+  padding: 4px 8px;
+  border-left: 1px solid var(--border-hi);
+  margin-left: 4px;
+  white-space: nowrap;
+}
+
+/* 表格区 */
+.table-wrap {
+  flex: 1;
+  overflow: auto;
+  background: var(--bg);
+  position: relative;
+}
+
+table.grid {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  font-family: "Consolas", "Microsoft YaHei", monospace;
+}
+
+table.grid thead {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--bg-2);
+}
+
+table.grid th {
+  text-align: left;
+  padding: 8px 10px;
+  font-weight: 600;
+  color: var(--accent);
+  border-bottom: 1px solid var(--border-hi);
+  border-right: 1px solid var(--border);
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  position: relative;
+  min-width: 50px;
+}
+table.grid th:hover { color: var(--green); }
+table.grid th .arrow { margin-left: 4px; opacity: 0.5; font-size: 9px; }
+table.grid th.sorted .arrow { opacity: 1; color: var(--green); }
+
+/* 列宽拖动手柄 */
+table.grid th .resizer {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  user-select: none;
+  z-index: 3;
+}
+table.grid th .resizer:hover,
+table.grid th .resizer.dragging {
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+}
+table.grid th .resizer::after {
+  content: '';
+  position: absolute;
+  right: 2px;
+  top: 25%;
+  bottom: 25%;
+  width: 1px;
+  background: var(--border-hi);
+}
+table.grid th .resizer:hover::after,
+table.grid th .resizer.dragging::after {
+  background: var(--accent);
+}
+
+table.grid td {
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 600px;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+table.grid tr:nth-child(even) td { background: var(--row-alt); }
+table.grid tr:hover td { background: var(--row-hover); color: var(--text-bright); }
+
+/* 文本选择样式 */
+table.grid td::selection,
+table.grid td *::selection { background: var(--accent-dim); color: var(--bg); }
+::-moz-selection { background: var(--accent-dim); color: var(--bg); }
+::selection { background: var(--accent-dim); color: var(--bg); }
+
+table.grid td.lvl-Error, table.grid td.lvl-Critical { color: var(--red); }
+table.grid td.lvl-Warning, table.grid td.lvl-AuditFailure { color: var(--yellow); }
+table.grid td.lvl-Information, table.grid td.lvl-Success, table.grid td.lvl-AuditSuccess { color: var(--text-dim); }
+
+.empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  font-family: "Consolas", monospace;
+  pointer-events: none;
+}
+.empty .icon { font-size: 48px; margin-bottom: 12px; opacity: 0.3; }
+.empty .hint { font-size: 11px; margin-top: 8px; }
+
+.loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 14, 20, 0.85);
+  z-index: 10;
+}
+.loading .spin {
+  width: 40px; height: 40px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading .text {
+  position: absolute;
+  bottom: calc(50% - 60px);
+  color: var(--accent);
+  font-family: "Consolas", monospace;
+  font-size: 12px;
+  text-shadow: 0 0 6px var(--accent);
+}
+
+/* 状态栏 */
+.statusbar {
+  background: var(--bg-2);
+  border-top: 1px solid var(--border);
+  padding: 5px 12px;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: "Consolas", monospace;
+  display: flex;
+  gap: 16px;
+  align-items: center;
+}
+.statusbar .seg { display: flex; align-items: center; gap: 4px; }
+.statusbar .seg .k { color: var(--text-dim); }
+.statusbar .seg .v { color: var(--text-bright); }
+.statusbar .seg .v.ok { color: var(--green); }
+.statusbar .seg .v.warn { color: var(--yellow); }
+.statusbar .spacer { flex: 1; }
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); }
+
+/* 子标签 */
+.subtabs {
+  background: var(--bg-3);
+  border-bottom: 1px solid var(--border-hi);
+  padding: 6px 12px;
+  display: flex;
+  gap: 4px;
+  min-height: 32px;
+  align-items: center;
+}
+.subtab {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  font-family: inherit;
+}
+.subtab:hover { color: var(--text); }
+.subtab.active { color: var(--green); border-bottom-color: var(--green); }
+
+/* 右键菜单 */
+.ctxmenu {
+  position: fixed;
+  background: var(--panel);
+  border: 1px solid var(--border-hi);
+  border-radius: 3px;
+  padding: 4px 0;
+  z-index: 1000;
+  min-width: 160px;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+}
+.ctxmenu .item {
+  padding: 6px 14px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text);
+}
+.ctxmenu .item:hover { background: var(--bg-3); color: var(--accent); }
+.ctxmenu .sep { height: 1px; background: var(--border); margin: 4px 0; }
+
+/* Toast */
+.toast {
+  position: fixed;
+  bottom: 40px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  padding: 8px 16px;
+  border-radius: 3px;
+  font-size: 12px;
+  z-index: 999;
+  box-shadow: 0 0 20px rgba(0, 212, 255, 0.3);
+  animation: toastIn 0.2s ease-out;
+}
+@keyframes toastIn {
+  from { opacity: 0; transform: translateX(-50%) translateY(10px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="titlebar">
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#00d4ff" stroke-width="1.5">
+          <path d="M12 2 L21 6 V12 C21 17 17 21 12 22 C7 21 3 17 3 12 V6 Z" />
+          <path d="M9 12 L11 14 L15 10" stroke="#00ff9d" stroke-width="2"/>
+        </svg>
+      </div>
+      <span>SecTrace</span>
+      <span class="ver">v{{VERSION}}</span>
+    </div>
+    <div class="indicators">
+      <div class="item"><span class="dot" id="dot-status"></span><span id="status-text">READY</span></div>
+      <div class="item">·</div>
+      <div class="item">管理员: <span id="admin-status" style="color:#7a8595">检测中</span></div>
+      <div class="item">·</div>
+      <div class="item" id="host-info">HOST</div>
+    </div>
+  </div>
+
+  <div class="tabs" id="tabs">
+    <button class="tab active" data-tab="browse"><span class="ico">🌐</span>浏览器历史 <span class="count" id="cnt-browse">0</span></button>
+    <button class="tab" data-tab="activity"><span class="ico">📋</span>系统活动 <span class="count" id="cnt-activity">0</span></button>
+    <button class="tab" data-tab="usb"><span class="ico">💾</span>USB 设备 <span class="count" id="cnt-usb">0</span></button>
+    <button class="tab" data-tab="autoruns"><span class="ico">⚙️</span>自启动项 <span class="count" id="cnt-autoruns">0</span></button>
+    <button class="tab" data-tab="programs"><span class="ico">📦</span>已安装程序 <span class="count" id="cnt-programs">0</span></button>
+  </div>
+  <div class="subtabs" id="subtabs" style="display:none">
+    <button class="subtab active" data-sub="全部">全部</button>
+    <button class="subtab" data-sub="程序执行">程序执行历史</button>
+    <button class="subtab" data-sub="文件访问">文件访问历史</button>
+    <button class="subtab" data-sub="键入历史">键入历史</button>
+    <button class="subtab" data-sub="系统事件">系统事件</button>
+    <button class="subtab" data-sub="故障事件">故障事件</button>
+  </div>
+
+  <div class="toolbar" id="toolbar">
+    <input type="text" class="tb-input" id="search" placeholder="🔍 关键字过滤 (实时)">
+    <select class="tb-select" id="browser-sel" style="display:none">
+      <option value="">全部浏览器</option>
+    </select>
+    <select class="tb-select" id="source-sel" style="display:none">
+      <option value="">全部场景</option>
+      <optgroup label="程序执行">
+        <option value="程序运行">程序运行</option>
+        <option value="BAM">后台程序 (BAM)</option>
+        <option value="UserAssist">UserAssist</option>
+      </optgroup>
+      <optgroup label="文件访问">
+        <option value="LNK">快捷方式</option>
+        <option value="JumpList">跳转列表</option>
+        <option value="最近访问">最近文件</option>
+        <option value="回收站">回收站</option>
+      </optgroup>
+      <optgroup label="键入历史">
+        <option value="RunMRU">运行命令</option>
+        <option value="TypedPaths">输入的路径</option>
+        <option value="TypedURLs">输入的 URL</option>
+      </optgroup>
+      <optgroup label="系统事件">
+        <option value="开关机">开关机</option>
+        <option value="网络">网络连接</option>
+        <option value="登录">登录登出 (含 RDP)</option>
+        <option value="计划任务">计划任务</option>
+      </optgroup>
+      <optgroup label="故障事件">
+        <option value="系统错误">蓝屏 (BSOD)</option>
+      </optgroup>
+    </select>
+    <select class="tb-select" id="limit-sel">
+      <option value="0">显示全部</option>
+      <option value="100">100 行</option>
+      <option value="500">500 行</option>
+      <option value="1000">1000 行</option>
+    </select>
+    <span class="tb-spacer"></span>
+    <span class="tb-stats" id="stats">-- / --</span>
+    <button class="tb-btn" id="btn-refresh" title="重新加载">🔄 刷新</button>
+    <button class="tb-btn" id="btn-copy" title="复制当前结果 (制表符分隔)">📑 复制</button>
+    <button class="tb-btn" id="btn-csv" title="导出 CSV (UTF-8 BOM)">📊 CSV</button>
+    <button class="tb-btn primary" id="btn-json" title="导出 JSON">📋 JSON</button>
+    <span class="tb-hint" title="拖动列边调整宽度 / 双击自适宽 / 拖选文本 Ctrl+C 复制">ⓘ 拖列调宽 · 拖选复制</span>
+  </div>
+
+  <div class="table-wrap" id="table-wrap">
+    <table class="grid" id="grid">
+      <thead><tr id="grid-head"></tr></thead>
+      <tbody id="grid-body"></tbody>
+    </table>
+    <div class="empty" id="empty">
+      <div class="icon">⬢</div>
+      <div>点击上方标签加载数据</div>
+      <div class="hint">SecTrace · System Forensics Toolkit</div>
+    </div>
+    <div class="loading" id="loading" style="display:none">
+      <div class="spin"></div>
+      <div class="text">SCANNING...</div>
+    </div>
+  </div>
+
+  <div class="statusbar">
+    <div class="seg"><span class="k">VIEW:</span><span class="v" id="sb-view">--</span></div>
+    <div class="seg"><span class="k">ROWS:</span><span class="v ok" id="sb-rows">0</span></div>
+    <div class="seg"><span class="k">FILTERED:</span><span class="v" id="sb-filt">0</span></div>
+    <div class="spacer"></div>
+    <div class="seg"><span class="k">UPDATED:</span><span class="v" id="sb-updated">--</span></div>
+    <div class="seg"><span class="k">PID:</span><span class="v" id="sb-pid">--</span></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+
+let DATA = {};   // 各 tab 缓存
+let EVENT_LOG_CACHE = {};  // 事件日志场景加载缓存, key = "evl_" + source 值
+let CURRENT = 'browse';
+let CURRENT_SUBTAB = '全部';  // 系统活动子标签
+let FILTER = '';
+let LIMIT = 0;
+let SOURCE = '';
+let BROWSER = '';
+
+// Tab 切换 (同时按需加载)
+$$('.tab').forEach(t => {
+  t.addEventListener('click', () => {
+    $$('.tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    CURRENT = t.dataset.tab;
+    // 切换 tab 时重置 filter
+    SOURCE = '';
+    BROWSER = '';
+    FILTER = '';
+    LIMIT = 0;
+    CURRENT_SUBTAB = '全部';
+    $('#source-sel').value = '';
+    $('#browser-sel').value = '';
+    $('#search').value = '';
+    $('#limit-sel').value = '0';
+    $$('.subtab').forEach(x => x.classList.toggle('active', x.dataset.sub === '全部'));
+    // 显隐 subtab bar / source filter / browser filter
+    $('#subtabs').style.display = CURRENT === 'activity' ? '' : 'none';
+    $('#source-sel').style.display = CURRENT === 'activity' ? '' : 'none';
+    $('#browser-sel').style.display = CURRENT === 'browse' ? '' : 'none';
+    if (!DATA[CURRENT]) {
+      loadTab(CURRENT);
+    } else {
+      render();
+    }
+  });
+});
+
+// Subtab click: 设置 SOURCE 映射并刷新
+// SOURCE 用 | 分隔多类型 (render 里的 filter 支持 includes 任一匹配)
+$$('.subtab').forEach(t => {
+  t.addEventListener('click', () => {
+    $$('.subtab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    CURRENT_SUBTAB = t.dataset.sub;
+    // 映射: 全部=清空; 其他=用 | 连接多个 Type 值
+    const MAP = {
+      '全部': '',
+      '程序执行': '程序运行|BAM|UserAssist',
+      '文件访问': 'LNK|JumpList|最近访问|回收站',
+      '键入历史': 'RunMRU|TypedPaths|TypedURLs',
+      '系统事件': '开关机|网络|登录|计划任务',
+      '故障事件': '系统错误',
+    };
+    SOURCE = MAP[CURRENT_SUBTAB] || '';
+    // subtab 选定时, 同步下拉框状态 (显示空, 因为下拉框是单选)
+    $('#source-sel').value = '';
+    render();
+  });
+});
+
+$('#search').addEventListener('input', e => {
+  FILTER = e.target.value.toLowerCase();
+  render();
+});
+
+$('#source-sel').addEventListener('change', async e => {
+  SOURCE = e.target.value;
+  // 场景选项 → 事件日志命令映射 (按需加载并合并到当前数据)
+  const SCENARIO_CMD = {
+    '开关机': 'evl_power',
+    '网络': 'evl_network',
+    '登录': 'evl_rdp',
+    '计划任务': 'evl_task',
+  };
+  if (SCENARIO_CMD[SOURCE]) {
+    const cacheKey = 'evl_' + SOURCE;
+    if (!EVENT_LOG_CACHE[cacheKey]) {
+      showLoading(true);
+      setStatus('读取事件日志: ' + SOURCE + ' (24h)...', 'warn');
+      try {
+        const res = await window.gosectrace(JSON.stringify([SCENARIO_CMD[SOURCE]]));
+        if (res && res.type === 'table' && res.rows && res.rows.length > 0) {
+          DATA.activity = (DATA.activity || []).concat(res.rows);
+          // 重新按时间倒序 (兼容 ≈ 前缀)
+          DATA.activity.sort((a, b) => timeKey(b[0]).localeCompare(timeKey(a[0])));
+          EVENT_LOG_CACHE[cacheKey] = true;
+          $('#cnt-activity').textContent = DATA.activity.length.toLocaleString();
+          toast(SOURCE + ': 已补充加载 ' + res.rows.length + ' 条事件日志');
+        } else if (res && res.type === 'error') {
+          toast(res.text);
+          // 保留筛选, 注册表数据仍可显示
+        } else {
+          EVENT_LOG_CACHE[cacheKey] = true;  // 空结果也标记, 避免重复拉
+          toast(SOURCE + ': 24h 内无事件日志记录 (仅显示注册表痕迹)');
+        }
+        setStatus('READY', 'ok');
+      } catch (err) {
+        toast('事件日志加载失败: ' + err);
+        setStatus('ERROR', 'err');
+      } finally {
+        showLoading(false);
+      }
+    }
+  }
+  render();
+});
+
+function timeKey(t) {
+  t = String(t || '');
+  // "≈2026-10-14 15:04:05" → 去掉 ≈ 前缀; "-" 排最后
+  if (t === '-') return '0000';
+  return t.replace(/^≈/, '');
+}
+
+$('#browser-sel').addEventListener('change', e => {
+  BROWSER = e.target.value;
+  render();
+});
+
+$('#limit-sel').addEventListener('change', e => {
+  LIMIT = parseInt(e.target.value) || 0;
+  render();
+});
+
+$('#btn-refresh').addEventListener('click', () => loadTab(CURRENT, true));
+$('#btn-copy').addEventListener('click', copyAll);
+$('#btn-csv').addEventListener('click', () => exportFile('csv'));
+$('#btn-json').addEventListener('click', () => exportFile('json'));
+
+// 双击行复制整行
+$('#grid-body').addEventListener('dblclick', e => {
+  const tr = e.target.closest('tr');
+  if (!tr) return;
+  const cells = [...tr.querySelectorAll('td')].map(c => c.textContent);
+  navigator.clipboard.writeText(cells.join('\t'));
+  toast('行已复制 (' + cells.length + ' 列)');
+});
+
+// 表头排序
+$('#grid-head').addEventListener('click', e => {
+  const th = e.target.closest('th');
+  if (!th) return;
+  // 忽略点击 resizer
+  if (e.target.classList.contains('resizer')) return;
+  const col = th.dataset.col;
+  if (!col) return;
+  const rows = DATA[CURRENT];
+  if (!rows) return;
+  const asc = th.classList.contains('sorted') && th.classList.contains('asc');
+  $$('#grid-head th').forEach(x => { x.classList.remove('sorted', 'asc', 'desc'); });
+  th.classList.add('sorted');
+  th.classList.add(asc ? 'desc' : 'asc');
+  const arrow = asc ? '▼' : '▲';
+  th.querySelector('.arrow').textContent = arrow;
+  rows.sort((a, b) => {
+    const va = (a[col] || '').toString();
+    const vb = (b[col] || '').toString();
+    const na = parseFloat(va), nb = parseFloat(vb);
+    if (!isNaN(na) && !isNaN(nb)) return asc ? nb - na : na - nb;
+    return asc ? vb.localeCompare(va) : va.localeCompare(vb);
+  });
+  render();
+});
+
+// 列宽拖动
+let resizeState = null;
+function startResize(e, colIdx, th) {
+  e.preventDefault();
+  e.stopPropagation();
+  resizeState = {
+    colIdx,
+    startX: e.clientX,
+    startWidth: th.offsetWidth,
+    th,
+  };
+  th.querySelector('.resizer').classList.add('dragging');
+  document.body.style.cursor = 'col-resize';
+  document.body.style.userSelect = 'none';
+}
+function doResize(e) {
+  if (!resizeState) return;
+  const delta = e.clientX - resizeState.startX;
+  const newW = Math.max(40, resizeState.startWidth + delta);
+  applyColWidth(resizeState.colIdx, newW);
+}
+function endResize() {
+  if (!resizeState) return;
+  // 保存到 localStorage
+  const widths = (loadColWidths(CURRENT) || []);
+  const ths = $$('#grid-head th');
+  widths.length = ths.length;
+  ths.forEach((t, i) => {
+    if (t.style.width) widths[i] = parseInt(t.style.width);
+  });
+  saveColWidths(CURRENT, widths);
+  resizeState.th.querySelector('.resizer').classList.remove('dragging');
+  document.body.style.cursor = '';
+  document.body.style.userSelect = '';
+  resizeState = null;
+}
+function applyColWidth(colIdx, w) {
+  const ths = $$('#grid-head th');
+  const tds = $$(`#grid-body td:nth-child(${colIdx + 1})`);
+  if (ths[colIdx]) {
+    ths[colIdx].style.width = w + 'px';
+    ths[colIdx].style.minWidth = w + 'px';
+  }
+  tds.forEach(td => {
+    td.style.width = w + 'px';
+    td.style.maxWidth = w + 'px';
+  });
+}
+function autoFitColumn(colIdx) {
+  // 临时显示所有内容测量宽度
+  const ths = $$('#grid-head th');
+  const tds = $$(`#grid-body td:nth-child(${colIdx + 1})`);
+  if (!ths[colIdx]) return;
+  // 用 canvas 测量
+  const canvas = autoFitColumn._canvas || (autoFitColumn._canvas = document.createElement('canvas'));
+  const ctx = canvas.getContext('2d');
+  ctx.font = '12px "Consolas", "Microsoft YaHei", monospace';
+  let max = ths[colIdx].textContent.length * 14;  // 粗略估算
+  // 测量表头
+  max = Math.max(max, ctx.measureText(ths[colIdx].textContent.trim()).width + 30);
+  // 测量前 200 行
+  const sample = Array.from(tds).slice(0, 200);
+  sample.forEach(td => {
+    const w = ctx.measureText(td.textContent).width + 24;
+    if (w > max) max = w;
+  });
+  applyColWidth(colIdx, Math.min(800, Math.max(60, Math.ceil(max))));
+}
+
+$('#grid-head').addEventListener('mousedown', e => {
+  if (!e.target.classList.contains('resizer')) return;
+  const colIdx = parseInt(e.target.dataset.colIdx);
+  const th = e.target.closest('th');
+  startResize(e, colIdx, th);
+});
+document.addEventListener('mousemove', doResize);
+document.addEventListener('mouseup', endResize);
+
+// 双击 resizer -> 自动适宽
+$('#grid-head').addEventListener('dblclick', e => {
+  if (!e.target.classList.contains('resizer')) return;
+  e.preventDefault();
+  const colIdx = parseInt(e.target.dataset.colIdx);
+  autoFitColumn(colIdx);
+  // 重新保存
+  const ths = $$('#grid-head th');
+  const widths = ths.map(t => t.style.width ? parseInt(t.style.width) : 0);
+  saveColWidths(CURRENT, widths);
+});
+
+function loadColWidths(tab) {
+  try {
+    const s = localStorage.getItem('secTrace.cols.' + tab);
+    return s ? JSON.parse(s) : [];
+  } catch (e) { return []; }
+}
+function saveColWidths(tab, widths) {
+  try {
+    localStorage.setItem('secTrace.cols.' + tab, JSON.stringify(widths));
+  } catch (e) {}
+}
+
+async function loadTab(tab, force) {
+  if (!force && DATA[tab] && DATA[tab].length > 0) return;
+  showLoading(true);
+  setStatus('SCANNING ' + tab.toUpperCase() + '...', 'warn');
+  try {
+    const req = JSON.stringify([tab, '-n', '0']);
+    const res = await window.gosectrace(req);
+    if (res && res.type === 'table' && res.rows) {
+      let rows = res.rows;
+      // 活动 tab 刷新: 基础数据重拉, 清空已按需加载的事件日志缓存
+      // (用户如需某个场景数据, 重新选下拉框的对应项即可)
+      if (tab === 'activity') {
+        for (const k of Object.keys(EVENT_LOG_CACHE)) EVENT_LOG_CACHE[k] = false;
+        toast('活动刷新完成: ' + rows.length + ' 条 (事件日志缓存已清空)');
+      }
+      DATA[tab] = rows;
+      $('#cnt-' + tab).textContent = rows.length.toLocaleString();
+      setStatus('READY', 'ok');
+      // 浏览器 tab: 动态填充浏览器下拉框
+      if (tab === 'browse') {
+        refreshBrowserOptions(DATA[tab]);
+      }
+    } else if (res && res.rows) {
+      DATA[tab] = res.rows;
+      $('#cnt-' + tab).textContent = res.rows.length.toLocaleString();
+    } else {
+      DATA[tab] = [];
+      toast('加载失败: ' + (res ? res.text : '无响应'));
+      setStatus('ERROR', 'err');
+    }
+  } catch (e) {
+    DATA[tab] = [];
+    setStatus('ERROR', 'err');
+    toast('错误: ' + e);
+  } finally {
+    showLoading(false);
+    render();
+  }
+}
+
+function refreshBrowserOptions(rows) {
+  // 从数据中收集所有浏览器, 按字母排序, 加数量
+  const counts = {};
+  rows.forEach(r => {
+    const b = r[1] || '';  // browser 列
+    if (b) counts[b] = (counts[b] || 0) + 1;
+  });
+  const browsers = Object.keys(counts).sort();
+  const sel = $('#browser-sel');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">全部浏览器 (' + rows.length + ')</option>' +
+    browsers.map(b => `<option value="${b}">${b} (${counts[b]})</option>`).join('');
+  if (browsers.includes(cur)) sel.value = cur;
+}
+
+function render() {
+  const rows = DATA[CURRENT] || [];
+  const meta = TAB_META[CURRENT];
+  const savedWidths = loadColWidths(CURRENT);
+  $('#grid-head').innerHTML = meta.cols.map((c, i) => {
+    const w = savedWidths[i];
+    const style = w ? ` style="width:${w}px;min-width:${w}px"` : '';
+    return `<th data-col="${meta.keys[i]}" data-col-idx="${i}"${style}>${c}<span class="arrow"></span><span class="resizer" data-col-idx="${i}"></span></th>`;
+  }).join('');
+
+  let display = rows;
+  if (BROWSER) {
+    display = display.filter(r => (r[1] || '') === BROWSER);
+  }
+  // 子标签 / SOURCE 过滤: 多类型用 | 分隔 (任一匹配即可)
+  if (SOURCE && SOURCE.indexOf('|') >= 0) {
+    const types = SOURCE.split('|').map(s => s.trim()).filter(Boolean);
+    if (types.length > 0) {
+      display = display.filter(r => {
+        const t = r[meta.srcKey] || '';
+        return types.some(x => t.indexOf(x) >= 0);
+      });
+    }
+  } else if (SOURCE) {
+    display = display.filter(r => (r[meta.srcKey] || '').includes(SOURCE));
+  }
+  if (FILTER) {
+    display = display.filter(r => meta.keys.some((k, i) => (r[i] || r[k] || '').toLowerCase().includes(FILTER)));
+  }
+  if (LIMIT > 0 && display.length > LIMIT) {
+    display = display.slice(0, LIMIT);
+  }
+
+  $('#sb-view').textContent = meta.title;
+  $('#sb-rows').textContent = rows.length.toLocaleString();
+  $('#sb-filt').textContent = display.length.toLocaleString();
+  $('#stats').textContent = `${display.length.toLocaleString()} / ${rows.length.toLocaleString()}`;
+
+  $('#empty').style.display = rows.length === 0 ? 'flex' : 'none';
+  $('#empty').firstElementChild.textContent = rows.length === 0 ? '⬢' : '';
+  if (rows.length === 0) {
+    $('#empty').lastElementChild.textContent = FILTER ? '无匹配结果' : '无数据 (或权限不足)';
+  }
+
+  const html = display.map(r => {
+    return '<tr>' + meta.keys.map((k, i) => {
+      const v = r[i] || r[k] || '';
+      const flagCls = String(v).startsWith('⚠') ? 'lvl-Error' : '';
+      return `<td title="${escapeAttr(v)}" class="${meta.lvlKey && k === meta.lvlKey ? 'lvl-' + v : ''} ${flagCls}">${escapeHtml(v)}</td>`;
+    }).join('') + '</tr>';
+  }).join('');
+  $('#grid-body').innerHTML = html;
+}
+
+function copyAll() {
+  const rows = DATA[CURRENT] || [];
+  const meta = TAB_META[CURRENT];
+  let display = rows;
+  if (BROWSER) display = display.filter(r => (r[1] || '') === BROWSER);
+  if (SOURCE) display = display.filter(r => (r[meta.srcKey] || '').includes(SOURCE));
+  if (FILTER) display = display.filter(r => meta.keys.some((k, i) => (r[i] || r[k] || '').toLowerCase().includes(FILTER)));
+  if (LIMIT > 0 && display.length > LIMIT) display = display.slice(0, LIMIT);
+
+  const lines = [meta.cols.join('\t')];
+  display.forEach(r => lines.push(meta.keys.map((k, i) => r[i] || r[k] || '').join('\t')));
+  navigator.clipboard.writeText(lines.join('\n'));
+  toast('已复制 ' + display.length + ' 行到剪贴板');
+}
+
+async function exportFile(fmt) {
+  const rows = DATA[CURRENT] || [];
+  const meta = TAB_META[CURRENT];
+  let display = rows;
+  if (BROWSER) display = display.filter(r => (r[1] || '') === BROWSER);
+  if (SOURCE) display = display.filter(r => (r[meta.srcKey] || '').includes(SOURCE));
+  if (FILTER) display = display.filter(r => meta.keys.some((k, i) => (r[i] || r[k] || '').toLowerCase().includes(FILTER)));
+  if (LIMIT > 0 && display.length > LIMIT) display = display.slice(0, LIMIT);
+
+  let content;
+  if (fmt === 'csv') {
+    const esc = v => '"' + String(v).replace(/"/g, '""') + '"';
+    const lines = [meta.cols.map(esc).join(',')];
+    display.forEach(r => lines.push(meta.keys.map((k, i) => esc(r[i] || r[k] || '')).join(',')));
+    content = '﻿' + lines.join('\n');  // BOM
+  } else {
+    const items = display.map(r => {
+      const o = {};
+      meta.cols.forEach((c, i) => o[c] = r[i] || r[meta.keys[i]] || '');
+      return o;
+    });
+    content = JSON.stringify(items, null, 2);
+  }
+  try {
+    const r = await window.exportData(JSON.stringify({format: fmt, data: content, tab: meta.title}));
+    toast(r);
+  } catch (e) {
+    toast('导出失败: ' + e);
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  }[c]));
+}
+function escapeAttr(s) { return escapeHtml(s).replace(/"/g, '&quot;'); }
+
+function showLoading(on) { $('#loading').style.display = on ? 'flex' : 'none'; }
+function setStatus(t, cls) {
+  $('#status-text').textContent = t;
+  const d = $('#dot-status');
+  d.className = 'dot' + (cls === 'warn' ? ' warn' : cls === 'err' ? ' err' : '');
+}
+function toast(msg) {
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 2000);
+}
+
+// 各 tab 的列定义
+const TAB_META = {
+  browse: {
+    title: '浏览器历史',
+    cols: ['时间', '浏览器', '标题', 'URL'],
+    keys: ['time', 'browser', 'title', 'url'],
+  },
+  activity: {
+    title: '系统活动',
+    cols: ['时间', '类型', '事件', '详情'],
+    keys: ['time', 'type', 'event', 'detail'],
+    srcKey: 1,  // 类型列 index, 用于 source filter
+  },
+  usb: {
+    title: 'USB 设备',
+    cols: ['VID', 'PID', '序列号', '名称', '最近插入'],
+    keys: ['vid', 'pid', 'serial', 'name', 'last'],
+  },
+  autoruns: {
+    title: '自启动项',
+    cols: ['启动位置', '名称', '命令', '可疑'],
+    keys: ['location', 'name', 'command', 'suspicious'],
+  },
+  programs: {
+    title: '已安装程序',
+    cols: ['名称', '版本', '发布者', '安装日期', '位置', '大小', '可疑'],
+    keys: ['name', 'version', 'publisher', 'date', 'location', 'size', 'suspicious'],
+  },
+};
+
+// 启动
+window.addEventListener('DOMContentLoaded', async () => {
+  try {
+    const info = await window.sysinfo('');
+    $('#admin-status').textContent = info.admin;
+    $('#admin-status').style.color = info.admin === '是' ? 'var(--green)' : 'var(--yellow)';
+    $('#host-info').textContent = 'HOST: ' + (info.hostname || 'LOCAL');
+    $('#sb-pid').textContent = info.pid || '?';
+  } catch (e) {}
+  // 显式激活 activity tab (新设计: 系统活动为主)
+  const t = document.querySelector('[data-tab="activity"]');
+  if (t) {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    CURRENT = 'activity';
+    // 显隐 subtab / source / browser filter
+    $('#subtabs').style.display = '';
+    $('#source-sel').style.display = '';
+  }
+  // 依次预加载所有 tab (按 tab 顺序串行加载, 避免阻塞)
+  // 浏览器历史最后加载, 因为它可能很大, 放最后让它先渲染其他 tab
+  loadTab('activity').then(() => loadTab('usb')).then(() => loadTab('autoruns')).then(() => loadTab('programs')).then(() => loadTab('browse'));
+});
+</script>
+</body>
+</html>
