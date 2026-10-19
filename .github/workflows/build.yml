@@ -44,46 +44,51 @@ jobs:
           echo "version=$VER" >> $GITHUB_OUTPUT
           echo "### SecTrace $VER" > RELEASE_NOTES.md
           echo "" >> RELEASE_NOTES.md
-          echo "Windows 应急取证辅助工具 (单文件 GUI, 无外部依赖)" >> RELEASE_NOTES.md
+          echo "Windows emergency forensics toolkit (single-file GUI, zero dependencies)" >> RELEASE_NOTES.md
           echo "" >> RELEASE_NOTES.md
-          echo "## 下载" >> RELEASE_NOTES.md
+          echo "## Downloads" >> RELEASE_NOTES.md
           echo "" >> RELEASE_NOTES.md
-          echo "| 文件 | 适用 |" >> RELEASE_NOTES.md
+          echo "| File | Target |" >> RELEASE_NOTES.md
           echo "|---|---|" >> RELEASE_NOTES.md
-          echo "| SecTrace_windows_x64.exe | 64 位 Windows (主流 PC) |" >> RELEASE_NOTES.md
-          echo "| SecTrace_windows_x86.exe | 32 位 Windows |" >> RELEASE_NOTES.md
-          echo "| SecTrace_windows_arm64.exe | ARM64 Windows (Surface Pro X 等) |" >> RELEASE_NOTES.md
+          echo "| SecTrace_windows_x64.exe | 64-bit Windows (most PCs) |" >> RELEASE_NOTES.md
+          echo "| SecTrace_windows_x86.exe | 32-bit Windows |" >> RELEASE_NOTES.md
+          echo "| SecTrace_windows_arm64.exe | ARM64 Windows (Surface Pro X etc) |" >> RELEASE_NOTES.md
           echo "" >> RELEASE_NOTES.md
-          echo "## 使用" >> RELEASE_NOTES.md
+          echo "## Usage" >> RELEASE_NOTES.md
           echo "" >> RELEASE_NOTES.md
-          echo "- 下载后双击运行 (GUI 界面, 无需安装)" >> RELEASE_NOTES.md
-          echo "- 事件日志功能需右键 → 以管理员身份运行" >> RELEASE_NOTES.md
-          echo "- 需要 WebView2 Runtime (Windows 10 1803+ 一般自带)" >> RELEASE_NOTES.md
-          echo "" >> RELEASE_NOTES.md
-          echo "## 校验" >> RELEASE_NOTES.md
-          echo "" >> RELEASE_NOTES.md
-          echo '```' >> RELEASE_NOTES.md
-          echo "# SHA-256" >> RELEASE_NOTES.md
-          certutil -hashfile outputs/*.exe SHA256 >> RELEASE_NOTES.md 2>&1 || true
-          echo '```' >> RELEASE_NOTES.md
+          echo "- Download, double-click to run (GUI, no install needed)" >> RELEASE_NOTES.md
+          echo "- Run as Administrator for event log features" >> RELEASE_NOTES.md
+          echo "- Requires WebView2 Runtime (built into Windows 10 1803+)" >> RELEASE_NOTES.md
 
       - name: Build x86
-        env: { GOOS: windows, GOARCH: '386', CGO_ENABLED: '0' }
+        shell: cmd
+        env:
+          GOOS: windows
+          GOARCH: '386'
+          CGO_ENABLED: '0'
         run: |
-          $ver = "${{ steps.ver.outputs.version }}"
-          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=$ver" -o outputs/SecTrace_windows_x86.exe .
+          if not exist outputs mkdir outputs
+          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=${{ steps.ver.outputs.version }}" -o outputs\SecTrace_windows_x86.exe .
 
       - name: Build x64
-        env: { GOOS: windows, GOARCH: amd64, CGO_ENABLED: '0' }
+        shell: cmd
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
         run: |
-          $ver = "${{ steps.ver.outputs.version }}"
-          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=$ver" -o outputs/SecTrace_windows_x64.exe .
+          if not exist outputs mkdir outputs
+          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=${{ steps.ver.outputs.version }}" -o outputs\SecTrace_windows_x64.exe .
 
       - name: Build arm64
-        env: { GOOS: windows, GOARCH: arm64, CGO_ENABLED: '0' }
+        shell: cmd
+        env:
+          GOOS: windows
+          GOARCH: arm64
+          CGO_ENABLED: '0'
         run: |
-          $ver = "${{ steps.ver.outputs.version }}"
-          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=$ver" -o outputs/SecTrace_windows_arm64.exe .
+          if not exist outputs mkdir outputs
+          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=${{ steps.ver.outputs.version }}" -o outputs\SecTrace_windows_arm64.exe .
 
       - name: Generate SHA-256
         shell: bash
@@ -92,9 +97,14 @@ jobs:
           for f in *.exe; do
             sha256sum "$f" > "$f.sha256"
           done
+          echo "" >> ../RELEASE_NOTES.md
+          echo "## SHA-256 Checksums" >> ../RELEASE_NOTES.md
+          echo "" >> ../RELEASE_NOTES.md
+          echo '```' >> ../RELEASE_NOTES.md
           cat *.sha256 >> ../RELEASE_NOTES.md
+          echo '```' >> ../RELEASE_NOTES.md
 
-      - name: Upload artifacts (branch push)
+      - name: Upload artifacts (non-tag push)
         uses: actions/upload-artifact@v4
         if: github.ref != 'refs/tags/v*'
         with:
