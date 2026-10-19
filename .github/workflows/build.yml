@@ -1,13 +1,15 @@
-name: Build
+name: Build & Release
 
 on:
   push:
-    branches: [master]
-  pull_request:
-    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
-  build:
+  build-release:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,39 +18,94 @@ jobs:
         with:
           go-version: '1.26'
 
-      - name: Vet
-        run: go vet ./...
+      - name: Vet & Test
+        run: |
+          go vet ./...
+          go test -count=1 ./...
 
-      - name: Test
-        run: go test -count=1 ./...
-
-      - name: Install rsrc (icon tool)
-        run: go install github.com/akavel/rsrc@latest
-
-      - name: Generate icon resources
+      - name: Install rsrc & Generate icons
         shell: cmd
         run: |
+          go install github.com/akavel/rsrc@latest
           for /f "delims=" %%i in ('go env GOPATH') do set GBIN=%%i\bin
           "%GBIN%\rsrc.exe" -arch 386   -ico assets\sectrace.ico -o rsrc_windows_386.syso
           "%GBIN%\rsrc.exe" -arch amd64 -ico assets\sectrace.ico -o rsrc_windows_amd64.syso
           "%GBIN%\rsrc.exe" -arch arm64 -ico assets\sectrace.ico -o rsrc_windows_arm64.syso
 
-      - name: Build (x86 / x64 / arm64)
-        shell: cmd
+      - name: Determine version
+        id: ver
+        shell: bash
         run: |
-          set CGO_ENABLED=0
-          set VER=%date:~0,4%%date:~5,2%%date:~8,2%+${{ github.sha }}
-          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=ci" -o outputs\SecTrace_windows_x86.exe .
-          set GOARCH=
-          set GOOS=windows
-          set GOARCH=386
-          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=ci" -o outputs\SecTrace_windows_x86.exe .
-          set GOARCH=amd64
-          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=ci" -o outputs\SecTrace_windows_x64.exe .
-          set GOARCH=arm64
-          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=ci" -o outputs\SecTrace_windows_arm64.exe .
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VER="${{ github.ref_name }}"
+          else
+            VER="v0.0.0-dev.${{ github.run_number }}"
+          fi
+          echo "version=$VER" >> $GITHUB_OUTPUT
+          echo "### SecTrace $VER" > RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "Windows 应急取证辅助工具 (单文件 GUI, 无外部依赖)" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "## 下载" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "| 文件 | 适用 |" >> RELEASE_NOTES.md
+          echo "|---|---|" >> RELEASE_NOTES.md
+          echo "| SecTrace_windows_x64.exe | 64 位 Windows (主流 PC) |" >> RELEASE_NOTES.md
+          echo "| SecTrace_windows_x86.exe | 32 位 Windows |" >> RELEASE_NOTES.md
+          echo "| SecTrace_windows_arm64.exe | ARM64 Windows (Surface Pro X 等) |" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "## 使用" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "- 下载后双击运行 (GUI 界面, 无需安装)" >> RELEASE_NOTES.md
+          echo "- 事件日志功能需右键 → 以管理员身份运行" >> RELEASE_NOTES.md
+          echo "- 需要 WebView2 Runtime (Windows 10 1803+ 一般自带)" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "## 校验" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo '```' >> RELEASE_NOTES.md
+          echo "# SHA-256" >> RELEASE_NOTES.md
+          certutil -hashfile outputs/*.exe SHA256 >> RELEASE_NOTES.md 2>&1 || true
+          echo '```' >> RELEASE_NOTES.md
 
-      - uses: actions/upload-artifact@v4
+      - name: Build x86
+        env: { GOOS: windows, GOARCH: '386', CGO_ENABLED: '0' }
+        run: |
+          $ver = "${{ steps.ver.outputs.version }}"
+          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=$ver" -o outputs/SecTrace_windows_x86.exe .
+
+      - name: Build x64
+        env: { GOOS: windows, GOARCH: amd64, CGO_ENABLED: '0' }
+        run: |
+          $ver = "${{ steps.ver.outputs.version }}"
+          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=$ver" -o outputs/SecTrace_windows_x64.exe .
+
+      - name: Build arm64
+        env: { GOOS: windows, GOARCH: arm64, CGO_ENABLED: '0' }
+        run: |
+          $ver = "${{ steps.ver.outputs.version }}"
+          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=$ver" -o outputs/SecTrace_windows_arm64.exe .
+
+      - name: Generate SHA-256
+        shell: bash
+        run: |
+          cd outputs
+          for f in *.exe; do
+            sha256sum "$f" > "$f.sha256"
+          done
+          cat *.sha256 >> ../RELEASE_NOTES.md
+
+      - name: Upload artifacts (branch push)
+        uses: actions/upload-artifact@v4
+        if: github.ref != 'refs/tags/v*'
         with:
           name: SecTrace_windows
           path: outputs/
+
+      - name: Create Release
+        if: github.ref == 'refs/tags/v*'
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          files: |
+            outputs/*.exe
+            outputs/*.sha256
