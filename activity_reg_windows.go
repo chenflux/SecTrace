@@ -67,7 +67,7 @@ func readRunMRU() []ActivityItem {
 			Approx: hasTime, // 近似时间 (键最后写入)
 			Type:   "RunMRU",
 			Event:  fmt.Sprintf("运行命令 #%d: %s", i+1, strings.TrimRight(val, "\x01")),
-			Detail: "完整值: " + val,
+			Detail: "完整值: " + val + " | ⚠ 所有条目共享键最后写入时间(≈最后一次使用 Run 对话框)",
 		})
 	}
 	return out
@@ -127,7 +127,7 @@ func readTypedURLs() []ActivityItem {
 			Approx: hasTime,
 			Type:   "TypedURLs",
 			Event:  fmt.Sprintf("IE键入URL [%s]: %s", name, val),
-			Detail: val,
+			Detail: val + " | ⚠ 共享键最后写入时间(≈最后一次使用地址栏)",
 		})
 	}
 	return out

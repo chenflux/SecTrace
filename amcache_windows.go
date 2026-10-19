@@ -13,7 +13,6 @@ package main
 import (
 	"fmt"
 	"sort"
-	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -113,9 +112,9 @@ func readAmcache() []ActivityItem {
 		pub, _, _ := sk.GetStringValue("Publisher")
 		ver, _, _ := sk.GetStringValue("Version")
 		link, _, _ := sk.GetStringValue("LinkDate")
-		sk.Close()
 
 		if path == "" && name == "" {
+			sk.Close()
 			continue
 		}
 		display := name
@@ -124,8 +123,6 @@ func readAmcache() []ActivityItem {
 		}
 		detail := fmt.Sprintf("路径: %s | 发布者: %s | 版本: %s | 链接日期: %s | 时间=键最后写入(≈首次执行)",
 			path, pub, ver, link)
-		var t interface{ IsZero() bool }
-		_ = t
 		item := ActivityItem{
 			Approx: true,
 			Type:   "Amcache",
@@ -133,27 +130,12 @@ func readAmcache() []ActivityItem {
 			Detail: detail,
 		}
 		if stat, serr := sk.Stat(); serr == nil {
-			_ = stat
-		}
-		// 时间: 重新打开拿 LastWriteTime (上面已 Close, 简化: 用子键再开一次太浪费 → 在循环里 stat)
-		out = append(out, item)
-	}
-	// 补时间戳 (再遍历一次拿 LastWriteTime)
-	for i := range out {
-		if i >= len(subs) {
-			break
-		}
-		sk, err := registry.OpenKey(k, subs[i], registry.READ)
-		if err != nil {
-			continue
-		}
-		if stat, serr := sk.Stat(); serr == nil {
-			out[i].Time = stat.ModTime()
+			item.Time = stat.ModTime()
 		}
 		sk.Close()
+		out = append(out, item)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
-	_ = strings.TrimSpace
 	return out
 }
 

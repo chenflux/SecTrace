@@ -7,6 +7,7 @@ package main
 
 import (
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -88,6 +89,23 @@ func indexStr(s, sub string) int {
 	return -1
 }
 
+// selfArtifactPatterns SecTrace 自身产生的痕迹 (运行时会污染结果)
+var selfArtifactPatterns = []string{
+	"SECTRACE", "SECTRACE.EXE", "SECTRACE.EXE-", "st_test", "st_gui_test",
+}
+
+// isSelfArtifact 判断条目是否为 SecTrace 自身运行产生的
+func isSelfArtifact(event, detail string) bool {
+	e := strings.ToUpper(event)
+	d := strings.ToUpper(detail)
+	for _, p := range selfArtifactPatterns {
+		if strings.Contains(e, p) || strings.Contains(d, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // collectUnifiedActivity 并发收集全部痕迹 → [时间,类型,事件,详情]
 func collectUnifiedActivity() [][]string {
 	collectors := activityCollectors()
@@ -116,6 +134,10 @@ func collectUnifiedActivity() [][]string {
 		label := collectors[i].name
 		_ = label
 		for _, it := range items {
+			// 过滤 SecTrace 自身痕迹 (Prefetch/BAM/UserAssist 会记录自己运行)
+			if isSelfArtifact(it.Event, it.Detail) {
+				continue
+			}
 			rows = append(rows, row{it.Time, []string{
 				formatActivityTime(it.Time, it.Approx), it.Type, it.Event, it.Detail,
 			}})
