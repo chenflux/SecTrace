@@ -58,9 +58,14 @@ exit /b 0
 :build_one
 REM %1=GOARCH %2=output name
 echo   - windows/%~1 ...
+
+REM 版本注入: 日期 + git 短SHA (无 git 时仅日期)
+set VER=%date:~0,4%%date:~5,2%%date:~8,2%
+for /f "delims=" %%g in ('git rev-parse --short HEAD 2^>nul') do set VER=%VER%+%%g
+
 set GOOS=windows
 set GOARCH=%~1
-%GOEXE% build -trimpath -ldflags "-s -w -H windowsgui" -o "outputs\SecTrace_windows_%~2.exe" .
+%GOEXE% build -trimpath -ldflags "-s -w -H windowsgui -X main.version=%VER%" -o "outputs\SecTrace_windows_%~2.exe" .
 if errorlevel 1 (
     echo     [X] %~1 build failed
     exit /b 1

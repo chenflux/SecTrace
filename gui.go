@@ -9,13 +9,12 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	webview "github.com/jchv/go-webview2"
 )
 
-const windowTitle = "SecTrace · 取证工具 v1.0"
+const windowTitleBase = "SecTrace · 取证工具"
 
 // guiMsg 前端消息结构
 type guiMsg struct {
@@ -31,7 +30,7 @@ func runGUI() {
 		Debug:     false,
 		AutoFocus: true,
 		WindowOptions: webview.WindowOptions{
-			Title:  windowTitle,
+			Title:  windowTitleBase + " v" + version,
 			Width:  1200,
 			Height: 760,
 			IconId: 0,
@@ -50,8 +49,6 @@ func runGUI() {
 }
 
 func bindAPI(w webview.WebView) {
-	var mu sync.Mutex
-	_ = mu
 
 	w.Bind("gosectrace", func(req string) (interface{}, error) {
 		var args []string
@@ -77,7 +74,12 @@ func bindAPI(w webview.WebView) {
 			}, nil
 
 		case "activity":
+			collectProgress = func(name string) {
+				w.Eval("window.scanProgress&&window.scanProgress(\"" + name + "\")")
+			}
 			rows := collectUnifiedActivity()
+			collectProgress = nil
+			w.Eval("window.scanDone&&window.scanDone()")
 			return guiMsg{
 				Type:    "table",
 				Text:    fmt.Sprintf("系统活动: %d 条", len(rows)),
@@ -108,7 +110,7 @@ func bindAPI(w webview.WebView) {
 				Rows:    rows,
 			}, nil
 
-		case "evl_power", "evl_network", "evl_rdp", "evl_task":
+		case "evl_power", "evl_network", "evl_rdp", "evl_task", "evl_ps":
 			// 场景化事件日志加载
 			if !IsAdmin() {
 				return guiMsg{
@@ -129,6 +131,7 @@ func bindAPI(w webview.WebView) {
 				"network": "网络连接/断开",
 				"rdp":     "远程登录 (RDP)",
 				"task":    "计划任务执行",
+				"ps":      "PowerShell 执行",
 			}
 			return guiMsg{
 				Type:    "table",
@@ -151,7 +154,7 @@ func bindAPI(w webview.WebView) {
 			return guiMsg{
 				Type:    "table",
 				Text:    fmt.Sprintf("自启动项: %d 条", len(rows)),
-				Columns: []string{"启动位置", "名称", "命令", "可疑"},
+				Columns: []string{"启动位置", "名称", "状态", "命令", "可疑"},
 				Rows:    rows,
 			}, nil
 
@@ -194,6 +197,15 @@ func bindAPI(w webview.WebView) {
 			return "导出失败: " + err.Error(), nil
 		}
 		return "已导出: " + fname, nil
+	})
+
+	w.Bind("getUIState", func(req string) (interface{}, error) {
+		return readUIStateFile(), nil
+	})
+
+	w.Bind("saveUIState", func(req string) (interface{}, error) {
+		saveUIStateFile(req)
+		return "ok", nil
 	})
 
 	w.Bind("sysinfo", func(req string) (interface{}, error) {
@@ -381,127 +393,6 @@ func formatActivityTime(t time.Time, approx bool) string {
 // 或专门的 EVTX 工具.
 //
 // 字段: [时间, 类型, 事件, 详情]
-func collectUnifiedActivity() [][]string {
-	const tsFormat = "2006-01-02 15:04:05"
-	type row struct {
-		time time.Time
-		cols []string
-	}
-	var rows []row
-
-	add := func(acts []ActivityItem, typeLabel string) {
-		for _, e := range acts {
-			rows = append(rows, row{e.Time, []string{
-				formatActivityTime(e.Time, e.Approx), typeLabel, e.Event, e.Detail,
-			}})
-		}
-	}
-
-	// 1) Prefetch
-	pf := readPrefetch(0)
-	if len(pf) == 0 {
-		rows = append(rows, row{time.Time{}, []string{
-			"-", "Prefetch", "未找到Prefetch记录",
-			"Prefetch日志已清理或权限不足",
-		}})
-	} else {
-		var converted []ActivityItem
-		for _, e := range pf {
-			prog := strings.TrimPrefix(e.Message, "执行程序: ")
-			converted = append(converted, ActivityItem{
-				Time: e.Time, Type: "程序运行",
-				Event:  "执行程序: " + prog,
-				Detail: `C:\Windows\Prefetch\` + prog + "-????????.pf",
-			})
-		}
-		add(converted, "程序运行")
-	}
-
-	// 2) 最近文件 (注册表) - 时间为键 LastWriteTime (近似)
-	rec := readRecentDocs()
-	if len(rec) > 0 {
-		var converted []ActivityItem
-		for _, e := range rec {
-			name, path := "", e.Message
-			if i := strings.Index(e.Message, "]: "); i > 0 {
-				name = e.Message[len("最近访问 ["):i]
-				path = e.Message[i+3:]
-			}
-			converted = append(converted, ActivityItem{
-				Time: e.Time, Approx: !e.Time.IsZero(),
-				Type:   "最近访问",
-				Event:  "文件/文件夹: " + name,
-				Detail: path + " | 时间=键最后写入(近似)",
-			})
-		}
-		add(converted, "最近访问")
-	} else {
-		rows = append(rows, row{time.Time{}, []string{
-			"-", "最近访问", "无最近访问记录", "",
-		}})
-	}
-
-	// 3) BSOD
-	for _, b := range readBSODInternal() {
-		rows = append(rows, row{b.time, []string{
-			b.time.Format(tsFormat), "系统错误", "蓝屏崩溃(BSOD)", b.detail,
-		}})
-	}
-
-	// 4) BAM
-	add(readBAM(), "BAM")
-
-	// 5) UserAssist
-	add(readUserAssist(), "UserAssist")
-
-	// 6) LNK 快捷方式
-	add(readLNKs(), "LNK")
-
-	// 7) Jump Lists
-	add(readJumpLists(), "JumpList")
-
-	// 8) RunMRU
-	add(readRunMRU(), "RunMRU")
-
-	// 9) TypedPaths
-	add(readTypedPaths(), "TypedPaths")
-
-	// 10) TypedURLs
-	add(readTypedURLs(), "TypedURLs")
-
-	// 11) 计划任务
-	add(readScheduledTasks(), "计划任务")
-
-	// 12) 回收站
-	add(readRecycleBin(), "回收站")
-
-	// 13) 网络配置 (网络连接/断开)
-	add(append(readNetworkProfiles(), readWirelessSignatures()...), "网络")
-
-	// 14) 电源 (开关机/休眠/更新)
-	add(readPowerEvents(), "开关机")
-
-	// 15) 用户会话 (登录/登出/配置)
-	add(readUserSessions(), "登录")
-
-	// 排序: 按时间倒序
-	sort.SliceStable(rows, func(i, j int) bool {
-		return rows[i].time.After(rows[j].time)
-	})
-
-	// 去重 (同时间同事件同详情)
-	seen := make(map[string]bool)
-	out := make([][]string, 0, len(rows))
-	for _, r := range rows {
-		key := r.cols[0] + "|" + r.cols[1] + "|" + r.cols[2] + "|" + r.cols[3]
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		out = append(out, r.cols)
-	}
-	return out
-}
 
 type bsodItem struct {
 	time   time.Time

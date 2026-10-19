@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const version = "1.0.0"
+var version = "1.0.0"
 
 type CommonFlags struct {
 	N       int
@@ -88,8 +88,7 @@ func usage() {
   gosectrace browse -browsers chrome,edge -o history.csv
   gosectrace activity -sources event,prefetch
   gosectrace activity -search "登录"
-  gosectrace all -o report -f json
-`)
+  gosectrace all -o report -f json`)
 }
 
 // parseBrowse 注册并解析 browse 子命令的所有 flag
@@ -181,32 +180,28 @@ func runBrowse(args []string) {
 }
 
 func runActivity(args []string) {
-	cf, sources := parseActivity("activity", args)
+	cf, _ := parseActivity("activity", args)
 
 	fmt.Println("=== 系统活动痕迹收集 ===")
-	events := CollectActivity(sources, cf.N)
+	// 与 GUI 统一口径: 15+ 类痕迹源合并时间线 (不含事件日志, 用 eventlog 子命令)
+	rows := collectUnifiedActivity()
+	if cf.N > 0 && len(rows) > cf.N {
+		rows = rows[:cf.N]
+	}
 	if cf.Search != "" {
-		var filtered []EventInfo
-		for _, e := range events {
-			if strings.Contains(strings.ToLower(e.Message), strings.ToLower(cf.Search)) ||
-				strings.Contains(strings.ToLower(e.Source), strings.ToLower(cf.Search)) {
-				filtered = append(filtered, e)
+		kw := strings.ToLower(cf.Search)
+		var filtered [][]string
+		for _, r := range rows {
+			if strings.Contains(strings.ToLower(r[2]), kw) ||
+				strings.Contains(strings.ToLower(r[3]), kw) ||
+				strings.Contains(strings.ToLower(r[1]), kw) {
+				filtered = append(filtered, r)
 			}
 		}
-		events = filtered
+		rows = filtered
 	}
 
-	headers := []string{"时间", "来源", "级别", "事件ID", "详情"}
-	rows := make([][]string, 0, len(events))
-	for _, e := range events {
-		rows = append(rows, []string{
-			e.Time.Local().Format("2006-01-02 15:04:05"),
-			e.LogName,
-			e.Level,
-			fmt.Sprintf("%d", e.EventID),
-			e.Message,
-		})
-	}
+	headers := []string{"时间", "类型", "事件", "详情"}
 	if cf.OutFile != "" {
 		format := cf.Format
 		if strings.HasSuffix(cf.OutFile, ".json") {
@@ -217,7 +212,7 @@ func runActivity(args []string) {
 		export(cf.OutFile, format, headers, rows)
 	} else {
 		printTable(headers, rows)
-		fmt.Printf("\n共 %d 条\n", len(events))
+		fmt.Printf("\n共 %d 条\n", len(rows))
 	}
 }
 

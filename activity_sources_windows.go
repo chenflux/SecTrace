@@ -1,36 +1,52 @@
 //go:build windows
 
-// LNK 快捷方式 (Recent 文件夹) - 用 PowerShell COM 解析
-// Jump Lists (AutomaticDestinations) - 列举文件 + 用 ole 解析
-// Recycle Bin $I 文件 - 二进制解析
-// Scheduled Tasks - XML 解析
+// LNK 快捷方式 (Recent 文件夹) 解析
+// Jump Lists (AutomaticDestinations) - 简化 OLE 扫描
+// Recycle Bin $I 文件 - 二进制解析 (全盘)
+// Scheduled Tasks - XML 解析 (递归)
 
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
 	"encoding/xml"
 	"fmt"
+	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 	"unicode/utf16"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
-// LnkEntry 单个 LNK 文件的解析结果
-type LnkEntry struct {
-	Target       string
-	WorkDir      string
-	Arguments    string
-	LnkModTime   time.Time
-	TargetMTime  time.Time // 来自 TargetIDList 的时间戳 (如可解析)
+// fixedDrives 枚举所有固定逻辑盘 (GetLogicalDrives + GetDriveType FIXED)
+func fixedDrives() []string {
+	getLogicalDrives := kernel32.NewProc("GetLogicalDrives")
+	getDriveType := kernel32.NewProc("GetDriveTypeW")
+	r, _, _ := getLogicalDrives.Call()
+	bits := uint32(r)
+	var drives []string
+	for i := 0; i < 26; i++ {
+		if bits&(1<<uint(i)) == 0 {
+			continue
+		}
+		letter := string(rune('A' + i)) + `:\`
+		p, _ := windows.UTF16PtrFromString(letter)
+		dt, _, _ := getDriveType.Call(uintptr(unsafe.Pointer(p)))
+		if dt == 3 { // DRIVE_FIXED
+			drives = append(drives, letter)
+		}
+	}
+	return drives
 }
 
+
 // readLNKs 扫描 %APPDATA%\Microsoft\Windows\Recent\*.lnk
+// 原生 MS-SHLLINK 解析 (无 PowerShell fork), 含目标三时间戳 + 卷序列号
 func readLNKs() []ActivityItem {
 	var out []ActivityItem
 	appdata := osGetenv("APPDATA")
@@ -42,100 +58,64 @@ func readLNKs() []ActivityItem {
 	if err != nil {
 		return out
 	}
-	// 限制最多 200 个
 	count := 0
 	for _, e := range entries {
-		if count >= 200 {
+		if count >= 300 {
 			break
 		}
 		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".lnk") {
 			continue
 		}
 		lnkPath := filepath.Join(recentDir, e.Name())
+		data, err := os.ReadFile(lnkPath)
+		if err != nil {
+			continue
+		}
+		p := parseLNKBytes(data)
+		if p == nil {
+			continue
+		}
 		fi, _ := e.Info()
 		var modTime time.Time
 		if fi != nil {
 			modTime = fi.ModTime()
 		}
-		// 解析 LNK (用 PowerShell COM)
-		info := parseLnkViaPowerShell(lnkPath)
-		if info == nil {
-			continue
-		}
-		target := info.Target
+		target := p.TargetPath
 		if target == "" {
 			target = e.Name()[:len(e.Name())-4] // 去 .lnk
 		}
-		args := info.Arguments
-		if args != "" {
-			target = target + " " + args
+		if p.Arguments != "" {
+			target = target + " " + p.Arguments
+		}
+		// 取证细节: 目标三时间戳 + 大小 + 卷序列号
+		detail := "→ " + target
+		if p.WorkingDir != "" {
+			detail += " | 工作目录: " + p.WorkingDir
+		}
+		if !p.WriteTime.IsZero() {
+			detail += fmt.Sprintf(" | 目标时间: 建%s/改%s",
+				p.CreateTime.Local().Format("01-02 15:04"), p.WriteTime.Local().Format("01-02 15:04"))
+		}
+		if p.VolumeSN != 0 {
+			detail += fmt.Sprintf(" | 卷SN: %08X", p.VolumeSN)
+		}
+		if p.FileSize > 0 {
+			detail += fmt.Sprintf(" | %d B", p.FileSize)
 		}
 		out = append(out, ActivityItem{
 			Time: modTime,
 			Type: "LNK",
 			Event: "快捷方式: " + e.Name(),
-			Detail: "→ " + target + " | 工作目录: " + info.WorkDir,
+			Detail: detail,
 		})
 		count++
 	}
-	// 按时间排序
-	sort.Slice(out, func(i, j int) bool {
+	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].Time.After(out[j].Time)
 	})
 	return out
 }
 
-// parseLnkViaPowerShell 调用 powershell 解析 LNK
-func parseLnkViaPowerShell(lnkPath string) *LnkEntry {
-	if _, err := os.Stat(lnkPath); err != nil {
-		return nil
-	}
-	// 转义路径中的单引号
-	escaped := strings.ReplaceAll(lnkPath, "'", "''")
-	psCmd := fmt.Sprintf(
-		"$ErrorActionPreference='SilentlyContinue';"+
-			"$s=New-Object -ComObject WScript.Shell;"+
-			"$l=$s.CreateShortcut('%s');"+
-			"Write-Output ([PSCustomObject]@{"+
-			"Target=[string]$l.TargetPath;"+
-			"WorkDir=[string]$l.WorkingDirectory;"+
-			"Arguments=[string]$l.Arguments}|ConvertTo-Json -Compress)",
-		escaped)
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil
-	}
-	// 简单解析 JSON
-	s := strings.TrimSpace(string(out))
-	if s == "" || s == "null" {
-		return nil
-	}
-	// 简单解析
-	info := &LnkEntry{}
-	for _, line := range strings.Split(s, ",") {
-		line = strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(line, `"Target":`):
-			info.Target = strings.Trim(line[9:], `"`)
-		case strings.HasPrefix(line, `"WorkDir":`):
-			info.WorkDir = strings.Trim(line[10:], `"`)
-		case strings.HasPrefix(line, `"Arguments":`):
-			info.Arguments = strings.Trim(line[12:], `"`)
-		}
-	}
-	// 简单 JSON 也可能没引号
-	if info.Target == "" {
-		// 尝试更宽松的解析
-		if idx := strings.Index(s, `"Target":"`); idx >= 0 {
-			rest := s[idx+10:]
-			if end := strings.Index(rest, `"`); end > 0 {
-				info.Target = rest[:end]
-			}
-		}
-	}
-	return info
-}
 
 // readJumpLists 扫描 %APPDATA%\Microsoft\Windows\Recent\AutomaticDestinations\*.automaticDestinations-ms
 func readJumpLists() []ActivityItem {
@@ -242,70 +222,66 @@ func parseJumpList(path string) []jlFile {
 	return files
 }
 
-// readRecycleBin 扫描 C:\$Recycle.Bin\<SID>\$I*
+// readRecycleBin 扫描所有固定盘的 $Recycle.Bin\<SID>\$I*
 func readRecycleBin() []ActivityItem {
 	var out []ActivityItem
-	recycleRoot := `C:\$Recycle.Bin`
-	entries, err := os.ReadDir(recycleRoot)
-	if err != nil {
-		return out
-	}
 	count := 0
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		sid := e.Name()
-		sidDir := filepath.Join(recycleRoot, sid)
-		files, err := os.ReadDir(sidDir)
+	for _, drive := range fixedDrives() {
+		recycleRoot := drive + `\$Recycle.Bin`
+		entries, err := os.ReadDir(recycleRoot)
 		if err != nil {
 			continue
 		}
-		for _, f := range files {
-			if count >= 200 {
-				break
-			}
-			if !strings.HasPrefix(f.Name(), "$I") {
+		for _, e := range entries {
+			if !e.IsDir() {
 				continue
 			}
-			info := parseRecycleBinI(filepath.Join(sidDir, f.Name()))
-			if info == nil {
+			sidDir := filepath.Join(recycleRoot, e.Name())
+			files, err := os.ReadDir(sidDir)
+			if err != nil {
 				continue
 			}
-			out = append(out, *info)
-			count++
+			for _, f := range files {
+				if count >= 500 {
+					sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
+					return out
+				}
+				if !strings.HasPrefix(f.Name(), "$I") {
+					continue
+				}
+				info := parseRecycleBinI(filepath.Join(sidDir, f.Name()), drive)
+				if info == nil {
+					continue
+				}
+				out = append(out, *info)
+				count++
+			}
 		}
 	}
-	// 按时间排序
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].Time.After(out[j].Time)
-	})
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
 	return out
 }
 
-// $I 文件格式 (Win 10):
-// 0-7: 头 (version=2 in little-endian)
-// 8-15: 原始文件大小
-// 16-23: 删除时间 FILETIME
-// 24-31: 原始文件大小 (重复, for streams)
-// 32-?: 原路径 (UTF-16LE, null-terminated)
-func parseRecycleBinI(path string) *ActivityItem {
+// $I 文件格式:
+//
+//	v2 (Vista+ / Win7+): 0-7 头(version=2) | 8-15 原始大小 | 16-23 删除时间
+//	                     FILETIME | 24-31 流大小 | 32+ 原路径 UTF-16LE
+//	v1 (Vista):          0-7 头(version=1) | 8-15 原始大小 | 16-23 删除时间
+//	                     FILETIME | 24+ 原路径 UTF-16LE
+func parseRecycleBinI(path string, drive string) *ActivityItem {
 	data, err := os.ReadFile(path)
 	if err != nil || len(data) < 32 {
 		return nil
 	}
-	// 校验 version (前 8 字节, 末位是 version)
-	version := binary.LittleEndian.Uint32(data[0:4])
-	if version == 0 || version > 10 {
-		// 可能是 Win 8+ 格式
+	version := binary.LittleEndian.Uint64(data[0:8])
+	if version != 1 && version != 2 {
+		return nil // 非法 $I 文件
 	}
 	origSize := binary.LittleEndian.Uint64(data[8:16])
 	ft := binary.LittleEndian.Uint64(data[16:24])
 	t := fileTimeToTime(ft)
-	// 路径 (offset 24 之后, UTF-16LE, null-terminated)
 	pathStart := 24
-	// Win10 在 24 之后还有 8 字节 (stream size), 然后 8 字节 padding, 然后 path
-	if len(data) > 32 {
+	if version == 2 {
 		pathStart = 32
 	}
 	if pathStart >= len(data) {
@@ -327,7 +303,7 @@ func parseRecycleBinI(path string) *ActivityItem {
 		Time: t,
 		Type: "回收站",
 		Event: "已删除: " + filepath.Base(origPath),
-		Detail: fmt.Sprintf("原路径: %s | 大小: %d 字节", origPath, origSize),
+		Detail: fmt.Sprintf("原路径: %s | 大小: %d 字节 | 盘: %s | 格式: v%d", origPath, origSize, drive, version),
 	}
 }
 
@@ -359,26 +335,40 @@ type taskXML struct {
 
 func readScheduledTasks() []ActivityItem {
 	var out []ActivityItem
-	dir := `C:\Windows\System32\Tasks`
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return out
+	root := `C:\Windows\System32\Tasks`
+	type taskRow struct {
+		rel  string
+		mod  time.Time
+		data []byte
 	}
-	count := 0
-	for _, e := range entries {
-		if count >= 200 {
-			break
-		}
-		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".xml") {
-			continue
-		}
-		full := filepath.Join(dir, e.Name())
-		data, err := os.ReadFile(full)
+	var tasks []taskRow
+	// 递归遍历: 任务几乎都在子目录 (\Microsoft\...) 里, 顶层只有零星几个
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			continue
+			return nil // 无权限子目录跳过
 		}
+		if d.IsDir() || !strings.EqualFold(filepath.Ext(p), ".xml") {
+			return nil
+		}
+		if len(tasks) >= 800 {
+			return fs.SkipAll
+		}
+		fi, _ := d.Info()
+		var mod time.Time
+		if fi != nil {
+			mod = fi.ModTime()
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, p)
+		tasks = append(tasks, taskRow{rel, mod, data})
+		return nil
+	})
+	for _, tk := range tasks {
 		var t taskXML
-		if err := xml.Unmarshal(data, &t); err != nil {
+		if err := xml.Unmarshal(tk.data, &t); err != nil {
 			continue
 		}
 		enabled := t.Settings.Enabled
@@ -393,38 +383,21 @@ func readScheduledTasks() []ActivityItem {
 		} else if t.Triggers.BootTrigger != nil {
 			trigger = "启动时"
 		}
-		// 任务名 = 文件名 (去 .xml, 反斜杠替换为 \)
-		name := strings.TrimSuffix(e.Name(), ".xml")
-		// 注册表任务用反斜杠表示路径, 比如 \Microsoft\Windows\...
-		// 替换为 /
-		displayName := strings.ReplaceAll(name, `\`, "/")
-		if displayName == "" {
-			displayName = name
-		}
+		name := strings.TrimSuffix(tk.rel, filepath.Ext(tk.rel))
 		detail := fmt.Sprintf("执行: %s %s | 作者: %s | 启用: %s",
 			t.Actions.Exec.Command, t.Actions.Exec.Arguments, t.RegistrationInfo.Author, enabled)
 		if trigger != "" {
 			detail += " | 触发: " + trigger
 		}
-		// 时间用文件修改时间
-		fi, _ := e.Info()
-		var modTime time.Time
-		if fi != nil {
-			modTime = fi.ModTime()
-		}
 		out = append(out, ActivityItem{
-			Time: modTime,
+			Time: tk.mod,
 			Type: "计划任务",
-			Event: "任务: " + displayName,
+			Event: "任务: " + name,
 			Detail: detail,
 		})
-		count++
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].Time.After(out[j].Time)
-	})
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
 	return out
 }
 
 // 抑制未用警告
-var _ = bytes.NewBuffer

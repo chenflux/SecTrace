@@ -1,14 +1,19 @@
 //go:build windows
 
-// 针对性事件日志读取 (4 个场景)
-// 开关机: System 6005/6006/6008/6009/6013/1074
-// 网络: NetworkProfile/Operational 10000/10001 + WLAN-AutoConfig/Operational 8001-8005
-// 远程登录: Security 4624/4625/4634/4647/4648/4672/4778/4779 (含 RDP=10 / Network=3 重点)
-// 计划任务: TaskScheduler/Operational 106/140/141/200/201/202
+// 事件日志场景化读取 (encoding/xml 重写版)
+//   power:   System 6005/6006/6008/6009/6013/1074
+//   network: NetworkProfile 10000/10001 + WLAN-AutoConfig 800x/1100x
+//   rdp:     Security 4624/4625/... + TerminalServices-LocalSessionManager 21/24/25
+//   task:    TaskScheduler 106/140/141/200/201/202
+//   ps:      PowerShell/Operational 4103/4104 (脚本块/管道)
+//
+// 读取策略: XPath 服务端过滤 (EID + 时间窗), 客户端兜底白名单
+// 详情: EventData 命名字段映射 + 位置型 data[N] + SID 翻译
 
 package main
 
 import (
+	"encoding/xml"
 	"fmt"
 	"sort"
 	"strings"
@@ -29,12 +34,76 @@ var (
 type evtHandleEL uintptr
 
 const (
-	EvtQueryChannelPathEL          = 0x1
+	EvtQueryChannelPathEL           = 0x1
 	EvtQueryTolerateQueryErrorsEL   = 0x1000
 	EvtRenderEventXmlEL             = 1
+	// 注: EvtQueryReverseDirection(0x2) 在部分 Windows 上报
+	// "parameter is incorrect", 不使用; 时间倒序在 Go 端排序
 )
 
-// 场景 → 渠道 → EID 白名单
+// evDataXML EventData 里的 <Data Name="X">Y</Data> 或匿名 <Data>Y</Data>
+type evDataXML struct {
+	Name  string `xml:"Name,attr"`
+	Value string `xml:",chardata"`
+}
+
+// evXML 事件 XML 结构 (encoding/xml 原生兼容单/双引号属性)
+type evXML struct {
+	System struct {
+		EventID     int    `xml:"EventID"`
+		Level       int    `xml:"Level"`
+		Provider    string `xml:"Provider"`
+		Computer    string `xml:"Computer"`
+		TimeCreated struct {
+			SystemTime string `xml:"SystemTime,attr"`
+		} `xml:"TimeCreated"`
+	} `xml:"System"`
+	EventData struct {
+		Data []evDataXML `xml:"Data"`
+	} `xml:"EventData"`
+}
+
+// parseEventXML 解析事件 XML → (eid, time, level, fields)
+// fields: 命名字段 + 位置型 data[N]
+func parseEventXML(xmlStr string) (int, time.Time, int, map[string]string) {
+	var ev evXML
+	if err := xml.Unmarshal([]byte(xmlStr), &ev); err != nil {
+		return 0, time.Time{}, 0, nil
+	}
+	var t time.Time
+	if s := ev.System.TimeCreated.SystemTime; s != "" {
+		for _, layout := range []string{
+			"2006-01-02T15:04:05.9999999Z",
+			"2006-01-02T15:04:05Z",
+			time.RFC3339Nano, time.RFC3339,
+		} {
+			if pt, err := time.Parse(layout, s); err == nil {
+				t = pt.Local()
+				break
+			}
+		}
+	}
+	fields := map[string]string{}
+	idx := 0
+	for _, d := range ev.EventData.Data {
+		v := strings.TrimSpace(d.Value)
+		if d.Name != "" {
+			fields[d.Name] = v
+		} else {
+			fields[fmt.Sprintf("data[%d]", idx)] = v
+			idx++
+		}
+	}
+	return ev.System.EventID, t, ev.System.Level, fields
+}
+
+// ---------- 场景定义 ----------
+
+type channelConfig struct {
+	Channel string
+	EIDs    []int
+}
+
 var scenarioChannels = map[string][]channelConfig{
 	"power": {
 		{Channel: "System", EIDs: []int{6005, 6006, 6008, 6009, 6013, 1074}},
@@ -45,80 +114,14 @@ var scenarioChannels = map[string][]channelConfig{
 	},
 	"rdp": {
 		{Channel: "Security", EIDs: []int{4624, 4625, 4634, 4647, 4648, 4672, 4778, 4779}},
+		{Channel: "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational", EIDs: []int{21, 24, 25, 39}},
 	},
 	"task": {
 		{Channel: "Microsoft-Windows-TaskScheduler/Operational", EIDs: []int{106, 140, 141, 200, 201, 202}},
 	},
-}
-
-type channelConfig struct {
-	Channel string
-	EIDs    []int
-}
-
-// readScenarioEvents 按场景读事件日志 (最近 24h)
-func readScenarioEvents(scenario string) []ActivityItem {
-	var out []ActivityItem
-	cutoff := timeNow().Add(-24 * time.Hour)
-	cfgs, ok := scenarioChannels[scenario]
-	if !ok {
-		return out
-	}
-	eidWhitelist := buildEIDWhitelist(scenario)
-
-	for _, cfg := range cfgs {
-		var idConds []string
-		for _, id := range cfg.EIDs {
-			idConds = append(idConds, fmt.Sprintf("EventID=%d", id))
-		}
-		idXPath := strings.Join(idConds, " or ")
-		cutoffStr := cutoff.UTC().Format("2006-01-02T15:04:05.000Z")
-		xpath := fmt.Sprintf(`*[System[(%s) and (TimeCreated[@SystemTime >= '%s'])]]`, idXPath, cutoffStr)
-
-		items := queryEventLogEL(cfg.Channel, xpath, eidWhitelist, true)
-		if scenario == "rdp" {
-			items = filterRDPEvents(items)
-		}
-		out = append(out, items...)
-	}
-
-	sort.SliceStable(out, func(i, j int) bool {
-		return out[i].Time.After(out[j].Time)
-	})
-	return out
-}
-
-func filterRDPEvents(items []ActivityItem) []ActivityItem {
-	var out []ActivityItem
-	for _, e := range items {
-		if strings.Contains(e.Event, "EID=4778") || strings.Contains(e.Event, "EID=4779") ||
-			strings.Contains(e.Event, "EID=4634") || strings.Contains(e.Event, "EID=4647") ||
-			strings.Contains(e.Event, "EID=4648") || strings.Contains(e.Event, "EID=4672") {
-			out = append(out, e)
-			continue
-		}
-		if strings.Contains(e.Event, "EID=4624") || strings.Contains(e.Event, "EID=4625") {
-			logonType := extractLogonType(e.Detail)
-			if logonType == "10" || logonType == "3" || logonType == "9" || logonType == "2" {
-				e.Event = e.Event + " [LogonType=" + logonType + "]"
-				out = append(out, e)
-			}
-		}
-	}
-	return out
-}
-
-func extractLogonType(detail string) string {
-	idx := strings.Index(detail, "LogonType=")
-	if idx >= 0 {
-		rest := detail[idx+len("LogonType="):]
-		end := strings.Index(rest, "|")
-		if end > 0 {
-			return strings.TrimSpace(rest[:end])
-		}
-		return strings.TrimSpace(rest)
-	}
-	return ""
+	"ps": {
+		{Channel: "Microsoft-Windows-PowerShell/Operational", EIDs: []int{4103, 4104, 400, 600}},
+	},
 }
 
 func buildEIDWhitelist(scenario string) map[int]string {
@@ -154,6 +157,10 @@ func buildEIDWhitelist(scenario string) map[int]string {
 		m[4672] = "特权登录"
 		m[4778] = "RDP 会话重连"
 		m[4779] = "RDP 会话断开"
+		m[21] = "RDP 会话登录"
+		m[24] = "RDP 会话断开"
+		m[25] = "RDP 会话重连"
+		m[39] = "会话断开 (管理员)"
 	case "task":
 		m[106] = "任务已创建"
 		m[140] = "任务已更新"
@@ -161,6 +168,11 @@ func buildEIDWhitelist(scenario string) map[int]string {
 		m[200] = "任务已启动"
 		m[201] = "任务已完成"
 		m[202] = "任务已终止"
+	case "ps":
+		m[4103] = "PowerShell 管道执行"
+		m[4104] = "PowerShell 脚本块"
+		m[400] = "PowerShell 引擎启动"
+		m[600] = "PowerShell 命令行"
 	}
 	return m
 }
@@ -175,260 +187,239 @@ func scenarioTypeLabel(scenario string) string {
 		return "登录"
 	case "task":
 		return "计划任务"
+	case "ps":
+		return "程序运行"
 	}
 	return "事件"
 }
 
-func queryEventLogEL(channel, xpath string, eidMap map[int]string, filterByEID bool) []ActivityItem {
+// readScenarioEvents 按场景读事件日志 (最近 24h, XPath 服务端过滤)
+func readScenarioEvents(scenario string) []ActivityItem {
+	var out []ActivityItem
+	cutoff := timeNow().Add(-24 * time.Hour)
+	cfgs, ok := scenarioChannels[scenario]
+	if !ok {
+		return out
+	}
+	eidMap := buildEIDWhitelist(scenario)
+
+	for _, cfg := range cfgs {
+		xpath := buildScenarioXPath(cfg.EIDs, cutoff)
+		items := queryEventLogEL(cfg.Channel, xpath, eidMap, scenario)
+		out = append(out, items...)
+	}
+
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].Time.After(out[j].Time)
+	})
+	return out
+}
+
+// buildScenarioXPath 构造服务端过滤 XPath (EID or 列表 + 时间窗)
+func buildScenarioXPath(eids []int, cutoff time.Time) string {
+	var idConds []string
+	for _, id := range eids {
+		idConds = append(idConds, fmt.Sprintf("EventID=%d", id))
+	}
+	cutoffStr := cutoff.UTC().Format("2006-01-02T15:04:05.000Z")
+	return fmt.Sprintf(`*[System[(%s) and TimeCreated[@SystemTime >= '%s']]]`,
+		strings.Join(idConds, " or "), cutoffStr)
+}
+
+// queryEventLogEL 拉取并解析一个渠道
+func queryEventLogEL(channel, xpath string, eidMap map[int]string, scenario string) []ActivityItem {
 	var out []ActivityItem
 	h, err := evtQueryEL_Query(channel, xpath)
 	if err != nil {
-		return out
+		// XPath 过滤失败时回退为纯时间窗 (客户端白名单)
+		cutoff := timeNow().Add(-24 * time.Hour)
+		fallback := fmt.Sprintf(`*[System[TimeCreated[@SystemTime >= '%s']]]`,
+			cutoff.UTC().Format("2006-01-02T15:04:05.000Z"))
+		h, err = evtQueryEL_Query(channel, fallback)
+		if err != nil {
+			return out
+		}
 	}
 	defer evtCloseEL_Close(h)
 
-	readCount := 0
-	for {
+	const hardCap = 5000 // 单渠道读取上限
+	read := 0
+	for read < hardCap {
 		handles, err := evtNextEL_Next(h, 100)
 		if err != nil || len(handles) == 0 {
 			break
 		}
+		done := true
 		for _, ev := range handles {
-			readCount++
-			if readCount > 2000 {
+			read++
+			if read > hardCap {
 				evtCloseEL_Close(ev)
-				break
+				continue
 			}
-			xmlStr, err := evtRenderEL_Render(ev)
+			xmlStr, rerr := evtRenderEL_Render(ev)
 			evtCloseEL_Close(ev)
-			if err != nil {
+			if rerr != nil {
 				continue
 			}
-			eventID := parseEventIDFromXML(xmlStr)
-			ts := parseTimeFromXML(xmlStr)
-			level := parseLevelFromXML(xmlStr)
-			fields := parseEventDataFields(xmlStr)
-			if eventID == 0 {
+			eid, ts, level, fields := parseEventXML(xmlStr)
+			if eid == 0 {
 				continue
 			}
-			if filterByEID {
-				if _, ok := eidMap[eventID]; !ok {
-					continue
-				}
+			if _, ok := eidMap[eid]; !ok {
+				continue // 客户端白名单兜底
 			}
-			desc, _ := eidMap[eventID]
-			eventName := fmt.Sprintf("%s (EID=%d)", desc, eventID)
-			if desc == "" {
-				eventName = fmt.Sprintf("EventID=%d (L=%s)", eventID, level)
-			}
-			detail := formatDetailForScenario(extractScenario(channel, eidMap), eventID, fields)
-			_ = level
+			desc := eidMap[eid]
+			eventName := fmt.Sprintf("%s (EID=%d)", desc, eid)
+			detail := formatDetailForScenario(scenario, channel, eid, fields)
 			out = append(out, ActivityItem{
 				Time:   ts,
-				Approx: false,
-				Type:   scenarioTypeLabel(extractScenario(channel, eidMap)),
+				Type:   scenarioTypeLabel(scenario),
 				Event:  eventName,
-				Detail: detail,
+				Detail: fmt.Sprintf("[L%d] %s", level, detail),
 			})
+			done = false
+		}
+		if done && len(handles) > 0 && read >= hardCap {
+			break
 		}
 	}
 	return out
 }
 
-// extractScenario 从 eidMap 的内容反推场景 (简单)
-func extractScenario(channel string, eidMap map[int]string) string {
-	for s, cfgs := range scenarioChannels {
-		for _, cfg := range cfgs {
-			if cfg.Channel == channel {
-				_ = s
-				// Check if the eidMap has any of cfg's EIDs
-				for _, id := range cfg.EIDs {
-					if _, ok := eidMap[id]; ok {
-						return s
-					}
-				}
-			}
+// formatDetailForScenario 场景化详情 (关键字段提取 + SID 翻译)
+func formatDetailForScenario(scenario, channel string, eid int, f map[string]string) string {
+	var d string
+	// TerminalServices-LocalSessionManager 频道优先
+	if strings.Contains(channel, "TerminalServices") {
+		switch eid {
+		case 21, 24, 25, 39:
+			d = fmt.Sprintf("用户: %s | 源IP: %s | 会话: RDP-Tcp#%s",
+				val(f, "User", "Param1"), val(f, "Address", "Param3"), val(f, "SessionID", "Param2"))
+			return translateSIDs(d)
 		}
 	}
-	return ""
-}
+	if strings.Contains(channel, "PowerShell") {
+		switch eid {
+		case 4104:
+			script := val(f, "ScriptBlockText", "data[1]")
+			if len(script) > 300 {
+				script = script[:300] + " ..."
+			}
+			d = fmt.Sprintf("路径: %s | 脚本: %s", val(f, "Path", "data[0]"), script)
+		case 4103:
+			payload := val(f, "Payload", "")
+			if len(payload) > 300 {
+				payload = payload[:300] + " ..."
+			}
+			d = fmt.Sprintf("管道: %s", payload)
+		case 400:
+			d = fmt.Sprintf("主机版本: %s | RunspaceID: %s",
+				val(f, "HostVersion", "data[0]"), val(f, "RunspaceId", ""))
+		case 600:
+			d = fmt.Sprintf("命令行: %s", val(f, "ContextInfo", "EventData"))
+			if len(d) > 320 {
+				d = d[:320] + " ..."
+			}
+		}
+		return translateSIDs(d)
+	}
 
-func formatDetailForScenario(scenario string, eid int, fields map[string]string) string {
 	switch scenario {
 	case "power":
 		switch eid {
 		case 1074:
-			return fmt.Sprintf("用户: %s | 进程: %s | 原因: %s | 类型: %s",
-				valueOr(fields, "param1", "?"),
-				valueOr(fields, "param2", "?"),
-				valueOr(fields, "param5", "?"),
-				valueOr(fields, "param4", "?"))
-		case 6008:
-			return fmt.Sprintf("上次关机异常: %s | 内核状态: %s",
-				valueOr(fields, "BugcheckDescription", "?"),
-				valueOr(fields, "BugcheckCode", "?"))
+			d = fmt.Sprintf("用户: %s | 进程: %s | 原因: %s | 类型: %s",
+				val(f, "param1", "data[0]"), val(f, "param2", "data[1]"),
+				val(f, "param5", "data[4]"), val(f, "param4", "data[3]"))
 		case 6013:
-			uptime := valueOr(fields, "data[4]", "?")
-			return fmt.Sprintf("系统正常运行: %s 秒", uptime)
+			d = fmt.Sprintf("正常运行: %s 秒", val(f, "data[4]", "Uptime"))
+		default:
+			d = fieldsToString(f)
 		}
-		return fieldsToString(fields)
-
 	case "network":
 		if eid == 10000 || eid == 10001 {
-			return fmt.Sprintf("配置: %s | 描述: %s | 类别: %s",
-				valueOr(fields, "ProfileName", "?"),
-				valueOr(fields, "Description", "?"),
-				valueOr(fields, "Category", "?"))
+			d = fmt.Sprintf("配置: %s | 描述: %s | 类别: %s",
+				val(f, "Name", "ProfileName"), val(f, "Description", ""), val(f, "Category", "data[5]"))
+		} else {
+			d = fmt.Sprintf("SSID: %s | 接口: %s",
+				val(f, "SSID", "ProfileName"), val(f, "Interface", "InterfaceGuid"))
 		}
-		return fmt.Sprintf("SSID: %s | 接口: %s",
-			valueOr(fields, "SSID", valueOr(fields, "ProfileName", "?")),
-			valueOr(fields, "Interface", valueOr(fields, "InterfaceGuid", "?")))
-
 	case "rdp":
 		switch eid {
 		case 4672:
-			return fmt.Sprintf("用户: %s | 域: %s | SID: %s | LogonId: %s",
-				valueOr(fields, "SubjectUserName", "?"),
-				valueOr(fields, "SubjectDomainName", "?"),
-				valueOr(fields, "SubjectUserSid", "?"),
-				valueOr(fields, "SubjectLogonId", "?"))
+			d = fmt.Sprintf("用户: %s | 域: %s | SID: %s | LogonId: %s",
+				val(f, "SubjectUserName", ""), val(f, "SubjectDomainName", ""),
+				val(f, "SubjectUserSid", ""), val(f, "SubjectLogonId", ""))
 		case 4778, 4779:
-			return fmt.Sprintf("用户: %s | 域: %s | 源IP: %s | 会话ID: %s",
-				valueOr(fields, "User", "?"),
-				valueOr(fields, "Domain", "?"),
-				valueOr(fields, "SourceNetworkAddress", "?"),
-				valueOr(fields, "SessionId", "?"))
+			d = fmt.Sprintf("用户: %s | 域: %s | 源IP: %s | 会话ID: %s",
+				val(f, "AccountName", "User"), val(f, "AccountDomain", "Domain"),
+				val(f, "ClientName", "SourceNetworkAddress"), val(f, "SessionId", ""))
 		case 4634, 4647, 4648:
-			return fmt.Sprintf("用户: %s | 域: %s | 登录ID: %s | 登录类型: %s",
-				valueOr(fields, "TargetUserName", "?"),
-				valueOr(fields, "TargetDomainName", "?"),
-				valueOr(fields, "TargetLogonId", "?"),
-				valueOr(fields, "LogonType", "?"))
+			d = fmt.Sprintf("用户: %s | 域: %s | 登录ID: %s | 登录类型: %s",
+				val(f, "TargetUserName", ""), val(f, "TargetDomainName", ""),
+				val(f, "TargetLogonId", ""), val(f, "LogonType", ""))
+		default: // 4624/4625
+			d = fmt.Sprintf("用户: %s | 域: %s | 源IP: %s | 登录类型: %s | 认证: %s | 进程: %s",
+				val(f, "TargetUserName", ""), val(f, "TargetDomainName", ""),
+				val(f, "IpAddress", val(f, "WorkstationName", "本地")),
+				val(f, "LogonType", "?"), val(f, "AuthenticationPackageName", ""),
+				val(f, "ProcessName", ""))
 		}
-		return fmt.Sprintf("用户: %s | 域: %s | 源IP: %s | 登录类型: %s | 认证: %s",
-			valueOr(fields, "TargetUserName", "?"),
-			valueOr(fields, "TargetDomainName", "?"),
-			valueOr(fields, "IpAddress", valueOr(fields, "WorkstationName", "本地")),
-			valueOr(fields, "LogonType", "?"),
-			valueOr(fields, "AuthenticationPackageName", "?"))
-
 	case "task":
-		if eid == 106 || eid == 140 || eid == 141 {
-			return fmt.Sprintf("任务: %s", valueOr(fields, "TaskName", valueOr(fields, "TaskPath", "?")))
+		name := val(f, "TaskName", val(f, "TaskPath", "data[0]"))
+		switch eid {
+		case 106, 140, 141:
+			d = fmt.Sprintf("任务: %s | 用户: %s", name, val(f, "UserName", "data[1]"))
+		default:
+			d = fmt.Sprintf("任务: %s | 动作: %s | 进程: %s",
+				name, val(f, "ActionName", ""), val(f, "ProcessName", "data[1]"))
 		}
-		if eid == 200 || eid == 201 || eid == 202 {
-			return fmt.Sprintf("任务: %s | 动作: %s",
-				valueOr(fields, "TaskName", valueOr(fields, "TaskPath", "?")),
-				valueOr(fields, "ActionName", ""))
-		}
-		return fieldsToString(fields)
+	default:
+		d = fieldsToString(f)
 	}
-	return fieldsToString(fields)
+	return translateSIDs(d)
 }
 
-func valueOr(m map[string]string, key, def string) string {
-	if v, ok := m[key]; ok && v != "" {
-		return v
+// val 多候选键取值
+func val(f map[string]string, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := f[k]; ok && v != "" {
+			return v
+		}
 	}
-	return def
+	return "?"
 }
 
-func fieldsToString(m map[string]string) string {
-	if len(m) == 0 {
+func fieldsToString(f map[string]string) string {
+	if len(f) == 0 {
 		return ""
 	}
 	var parts []string
-	for k, v := range m {
-		if v == "" {
+	for k, v := range f {
+		if v == "" || strings.HasPrefix(k, "data[") {
 			continue
 		}
 		parts = append(parts, k+"="+v)
 	}
-	return strings.Join(parts, " | ")
-}
-
-func parseEventDataFields(xml string) map[string]string {
-	out := map[string]string{}
-	start := indexOfStr(xml, "<EventData>")
-	if start >= 0 {
-		end := indexOfStr(xml, "</EventData>")
-		if end >= 0 {
-			parseDataFieldsInRange(xml[start:end], out)
-			return out
-		}
-	}
-	parseDataFieldsInRange(xml, out)
-	return out
-}
-
-func parseDataFieldsInRange(s string, out map[string]string) {
-	i := 0
-	idx := 0
-	loopCount := 0
-	for {
-		loopCount++
-		if loopCount <= 3 {
-		}
-		if loopCount > 50 {
-			break
-		}
-		ds := indexOfStr(s[i:], "<Data")
-		if ds < 0 {
-			break
-		}
-		gt := indexOfStr(s[i+ds:], ">")
-		if gt < 0 {
-			break
-		}
-		tagStart := i + ds
-		tagEnd := i + ds + gt
-		name := extractAttr(s[tagStart:tagEnd], "Name")
-		de := indexOfStr(s[i+ds+gt:], "</Data>")
-		if de < 0 {
-			break
-		}
-		value := s[i+ds+gt+1 : i+ds+gt+de]
-		value = decodeHTMLEscapes(value)
-		if name != "" {
-			out[name] = value
-		} else {
-			out[fmt.Sprintf("data[%d]", idx)] = value
-			idx++
-		}
-		i = i + ds + gt + de + len("</Data>")
-	}
-}
-
-func extractAttr(tag, attr string) string {
-	for _, q := range []byte{34, 39} {
-		key1 := " " + attr + "=" + string(q)
-		key2 := attr + "=" + string(q)
-		if i := indexOfStr(tag, key1); i >= 0 {
-			start := i + len(key1)
-			if end := indexOfStr(tag[start:], string(q)); end >= 0 {
-				return tag[start : start+end]
+	if len(parts) == 0 {
+		// 只有位置型数据时拼接
+		for i := 0; ; i++ {
+			k := fmt.Sprintf("data[%d]", i)
+			if v, ok := f[k]; ok && v != "" {
+				parts = append(parts, v)
+				continue
 			}
-		}
-		if i := indexOfStr(tag, key2); i >= 0 {
-			start := i + len(key2)
-			if end := indexOfStr(tag[start:], string(q)); end >= 0 {
-				return tag[start : start+end]
-			}
+			break
 		}
 	}
-	return ""
-}
-
-func decodeHTMLEscapes(s string) string {
-	s = strings.ReplaceAll(s, "&amp;", "&")
-	s = strings.ReplaceAll(s, "&lt;", "<")
-	s = strings.ReplaceAll(s, "&gt;", ">")
-	s = strings.ReplaceAll(s, "&quot;", `"`)
-	s = strings.ReplaceAll(s, "&apos;", "'")
+	s := strings.Join(parts, " | ")
+	if len(s) > 400 {
+		s = s[:400] + " ..."
+	}
 	return s
 }
 
-// ============== EvtQuery API 封装 (用 golang.org/x/sys/windows 的 LazyProc) ==============
+// ---------- EvtQuery API 封装 ----------
 
 func evtQueryEL_Query(channel, xpath string) (evtHandleEL, error) {
 	pCh, err := windows.UTF16PtrFromString(channel)
@@ -440,17 +431,13 @@ func evtQueryEL_Query(channel, xpath string) (evtHandleEL, error) {
 		return 0, err
 	}
 	flags := uint32(EvtQueryChannelPathEL | EvtQueryTolerateQueryErrorsEL)
-	r, _, errno := procEvtQueryEL.Call(
-		0,
-		uintptr(unsafe.Pointer(pCh)),
-		uintptr(unsafe.Pointer(pXp)),
-		uintptr(flags),
-	)
+	r, _, errno := procEvtQueryEL.Call(0,
+		uintptr(unsafe.Pointer(pCh)), uintptr(unsafe.Pointer(pXp)), uintptr(flags))
 	if r == 0 {
 		if errno != nil && errno != windowsErrno(0) {
-			return 0, fmt.Errorf("EvtQuery %s 失败: %v", channel, errno)
+			return 0, fmt.Errorf("EvtQuery %s: %v", channel, errno)
 		}
-		return 0, fmt.Errorf("EvtQuery %s 失败: err=%d", channel, windows.GetLastError())
+		return 0, fmt.Errorf("EvtQuery %s: err=%d", channel, windows.GetLastError())
 	}
 	return evtHandleEL(r), nil
 }
@@ -461,21 +448,16 @@ func evtNextEL_Next(h evtHandleEL, max int) ([]evtHandleEL, error) {
 	}
 	var got uint32
 	arr := make([]evtHandleEL, max)
-	r, _, errno := procEvtNextEL.Call(
-		uintptr(h),
-		uintptr(max),
-		uintptr(unsafe.Pointer(&arr[0])),
-		0, 0,
-		uintptr(unsafe.Pointer(&got)),
-	)
+	r, _, errno := procEvtNextEL.Call(uintptr(h), uintptr(max),
+		uintptr(unsafe.Pointer(&arr[0])), 0, 0, uintptr(unsafe.Pointer(&got)))
 	if r == 0 {
-		if errno == windowsErrno(259) {
+		if errno == windowsErrno(259) { // ERROR_NO_MORE_ITEMS
 			return arr[:got], nil
 		}
 		if errno != nil && errno != windowsErrno(0) {
-			return nil, fmt.Errorf("EvtNext 失败: %v", errno)
+			return nil, fmt.Errorf("EvtNext: %v", errno)
 		}
-		return nil, fmt.Errorf("EvtNext 失败: err=%d", windows.GetLastError())
+		return nil, fmt.Errorf("EvtNext: err=%d", windows.GetLastError())
 	}
 	return arr[:got], nil
 }
@@ -483,32 +465,20 @@ func evtNextEL_Next(h evtHandleEL, max int) ([]evtHandleEL, error) {
 func evtRenderEL_Render(h evtHandleEL) (string, error) {
 	var bufUsed uint32
 	var propCount uint32
-	procEvtRenderEL.Call(
-		0,
-		uintptr(h),
-		uintptr(EvtRenderEventXmlEL),
-		0, 0,
-		uintptr(unsafe.Pointer(&bufUsed)),
-		uintptr(unsafe.Pointer(&propCount)),
-	)
+	procEvtRenderEL.Call(0, uintptr(h), uintptr(EvtRenderEventXmlEL), 0, 0,
+		uintptr(unsafe.Pointer(&bufUsed)), uintptr(unsafe.Pointer(&propCount)))
 	if bufUsed == 0 {
-		return "", fmt.Errorf("EvtRender: 缓冲区大小未知")
+		return "", fmt.Errorf("EvtRender: 缓冲区未知")
 	}
 	buf := make([]uint16, bufUsed+1)
-	r, _, errno := procEvtRenderEL.Call(
-		0,
-		uintptr(h),
-		uintptr(EvtRenderEventXmlEL),
-		uintptr(len(buf)),
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(unsafe.Pointer(&bufUsed)),
-		uintptr(unsafe.Pointer(&propCount)),
-	)
+	r, _, errno := procEvtRenderEL.Call(0, uintptr(h), uintptr(EvtRenderEventXmlEL),
+		uintptr(len(buf)), uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(unsafe.Pointer(&bufUsed)), uintptr(unsafe.Pointer(&propCount)))
 	if r == 0 {
 		if errno != nil && errno != windowsErrno(0) {
-			return "", fmt.Errorf("EvtRender 失败: %v", errno)
+			return "", fmt.Errorf("EvtRender: %v", errno)
 		}
-		return "", fmt.Errorf("EvtRender 失败: err=%d", windows.GetLastError())
+		return "", fmt.Errorf("EvtRender: err=%d", windows.GetLastError())
 	}
 	return windows.UTF16ToString(buf), nil
 }
@@ -517,96 +487,10 @@ func evtCloseEL_Close(h evtHandleEL) {
 	procEvtCloseEL.Call(uintptr(h))
 }
 
-// windowsErrno 包装 (避免直接 syscall.Errno 类型比较在不同 Go 版本报错)
+// windowsErrno errno 包装
 func windowsErrno(v uintptr) error {
 	if v == 0 {
 		return nil
 	}
 	return fmt.Errorf("errno=%d", v)
-}
-
-// 公共 XML 解析辅助 (从 eventlog_windows.go 复用)
-func indexOfStr(s, sub string) int {
-	if sub == "" {
-		return 0
-	}
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
-}
-
-func parseIntStr(s string) int {
-	n := 0
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return 0
-		}
-		n = n*10 + int(c-'0')
-	}
-	return n
-}
-
-func parseEventIDFromXML(xml string) int {
-	start := indexOfStr(xml, "<EventID>")
-	if start < 0 {
-		start = indexOfStr(xml, "<EventID ")
-		if start < 0 {
-			return 0
-		}
-		gIdx := indexOfStr(xml[start:], ">")
-		if gIdx < 0 {
-			return 0
-		}
-		start = start + gIdx + 1
-	} else {
-		start += len("<EventID>")
-	}
-	end := indexOfStr(xml[start:], "</EventID>")
-	if end < 0 {
-		return 0
-	}
-	return parseIntStr(xml[start : start+end])
-}
-
-func parseTimeFromXML(xml string) time.Time {
-	// XML 属性可能是单引号或双引号, 两种都试
-	for _, q := range []byte{34, 39} {
-		tag := `<TimeCreated SystemTime=` + string(q)
-		idx := indexOfStr(xml, tag)
-		if idx < 0 {
-			continue
-		}
-		start := idx + len(tag)
-		end := indexOfStr(xml[start:], string(q))
-		if end < 0 {
-			continue
-		}
-		s := xml[start : start+end]
-		for _, layout := range []string{
-			"2006-01-02T15:04:05.9999999Z",
-			"2006-01-02T15:04:05Z",
-			time.RFC3339Nano, time.RFC3339,
-		} {
-			if t, err := time.Parse(layout, s); err == nil {
-				return t.Local()
-			}
-		}
-	}
-	return time.Time{}
-}
-
-func parseLevelFromXML(xml string) string {
-	start := indexOfStr(xml, "<Level>")
-	if start < 0 {
-		return ""
-	}
-	start += len("<Level>")
-	end := indexOfStr(xml[start:], "</Level>")
-	if end < 0 {
-		return ""
-	}
-	return xml[start : start+end]
 }

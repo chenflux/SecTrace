@@ -231,6 +231,14 @@ body::before {
 }
 .tb-stats b { color: var(--green); font-weight: 600; }
 
+.tb-chip {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 12px; color: var(--red); cursor: pointer;
+  padding: 4px 8px; border: 1px solid var(--red); border-radius: 3px;
+  user-select: none; white-space: nowrap;
+}
+.tb-chip input { accent-color: var(--red); cursor: pointer; }
+
 .tb-hint {
   font-size: 10px;
   color: var(--text-dim);
@@ -546,6 +554,9 @@ table.grid td.lvl-Information, table.grid td.lvl-Success, table.grid td.lvl-Audi
       <option value="500">500 行</option>
       <option value="1000">1000 行</option>
     </select>
+    <label class="tb-chip" id="susp-only-wrap" style="display:none" title="只显示带 ⚠ 标记的可疑项">
+      <input type="checkbox" id="susp-only"> 只看可疑
+    </label>
     <span class="tb-spacer"></span>
     <span class="tb-stats" id="stats">-- / --</span>
     <button class="tb-btn" id="btn-refresh" title="重新加载">🔄 刷新</button>
@@ -575,6 +586,7 @@ table.grid td.lvl-Information, table.grid td.lvl-Success, table.grid td.lvl-Audi
     <div class="seg"><span class="k">VIEW:</span><span class="v" id="sb-view">--</span></div>
     <div class="seg"><span class="k">ROWS:</span><span class="v ok" id="sb-rows">0</span></div>
     <div class="seg"><span class="k">FILTERED:</span><span class="v" id="sb-filt">0</span></div>
+    <span id="scan-status" style="color:var(--accent)"></span>
     <div class="spacer"></div>
     <div class="seg"><span class="k">UPDATED:</span><span class="v" id="sb-updated">--</span></div>
     <div class="seg"><span class="k">PID:</span><span class="v" id="sb-pid">--</span></div>
@@ -585,6 +597,8 @@ table.grid td.lvl-Information, table.grid td.lvl-Success, table.grid td.lvl-Audi
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 
+let UI_STATE = {};  // Go 侧持久化的界面状态 (列宽等)
+let SUSP_ONLY = false;
 let DATA = {};   // 各 tab 缓存
 let EVENT_LOG_CACHE = {};  // 事件日志场景加载缓存, key = "evl_" + source 值
 let CURRENT = 'browse';
@@ -615,6 +629,10 @@ $$('.tab').forEach(t => {
     $('#subtabs').style.display = CURRENT === 'activity' ? '' : 'none';
     $('#source-sel').style.display = CURRENT === 'activity' ? '' : 'none';
     $('#browser-sel').style.display = CURRENT === 'browse' ? '' : 'none';
+    $('#susp-only-wrap').style.display = (CURRENT === 'autoruns' || CURRENT === 'programs') ? '' : 'none';
+    if (CURRENT !== 'autoruns' && CURRENT !== 'programs') {
+      SUSP_ONLY = false; $('#susp-only').checked = false;
+    }
     if (!DATA[CURRENT]) {
       loadTab(CURRENT);
     } else {
@@ -633,8 +651,8 @@ $$('.subtab').forEach(t => {
     // 映射: 全部=清空; 其他=用 | 连接多个 Type 值
     const MAP = {
       '全部': '',
-      '程序执行': '程序运行|BAM|UserAssist',
-      '文件访问': 'LNK|JumpList|最近访问|回收站',
+      '程序执行': '程序运行|BAM|UserAssist|Shimcache|Amcache',
+      '文件访问': 'LNK|JumpList|最近访问|回收站|MOTW',
       '键入历史': 'RunMRU|TypedPaths|TypedURLs',
       '系统事件': '开关机|网络|登录|计划任务',
       '故障事件': '系统错误',
@@ -642,6 +660,21 @@ $$('.subtab').forEach(t => {
     SOURCE = MAP[CURRENT_SUBTAB] || '';
     // subtab 选定时, 同步下拉框状态 (显示空, 因为下拉框是单选)
     $('#source-sel').value = '';
+    // 程序执行子标签: 顺带按需加载 PowerShell 事件日志 (缓存)
+    if (CURRENT_SUBTAB === '程序执行' && !EVENT_LOG_CACHE['evl_ps']) {
+      showLoading(true);
+      window.gosectrace(JSON.stringify(['evl_ps'])).then(res => {
+        if (res && res.type === 'table' && res.rows && res.rows.length > 0) {
+          DATA.activity = (DATA.activity || []).concat(res.rows);
+          DATA.activity.sort((a, b) => timeKey(b[0]).localeCompare(timeKey(a[0])));
+          $('#cnt-activity').textContent = DATA.activity.length.toLocaleString();
+          toast('PowerShell 日志: ' + res.rows.length + ' 条已加载');
+        }
+        EVENT_LOG_CACHE['evl_ps'] = true;
+      }).catch(() => { EVENT_LOG_CACHE['evl_ps'] = true; })
+        .finally(() => { showLoading(false); render(); });
+      return;
+    }
     render();
   });
 });
@@ -707,6 +740,11 @@ $('#browser-sel').addEventListener('change', e => {
 
 $('#limit-sel').addEventListener('change', e => {
   LIMIT = parseInt(e.target.value) || 0;
+  render();
+});
+
+$('#susp-only').addEventListener('change', e => {
+  SUSP_ONLY = e.target.checked;
   render();
 });
 
@@ -842,13 +880,14 @@ $('#grid-head').addEventListener('dblclick', e => {
 
 function loadColWidths(tab) {
   try {
-    const s = localStorage.getItem('secTrace.cols.' + tab);
-    return s ? JSON.parse(s) : [];
+    const w = UI_STATE['cols.' + tab];
+    return w ? w : [];
   } catch (e) { return []; }
 }
 function saveColWidths(tab, widths) {
   try {
-    localStorage.setItem('secTrace.cols.' + tab, JSON.stringify(widths));
+    UI_STATE['cols.' + tab] = widths;
+    if (window.saveUIState) window.saveUIState(JSON.stringify(UI_STATE));
   } catch (e) {}
 }
 
@@ -936,6 +975,9 @@ function render() {
   if (FILTER) {
     display = display.filter(r => meta.keys.some((k, i) => (r[i] || r[k] || '').toLowerCase().includes(FILTER)));
   }
+  if (SUSP_ONLY) {
+    display = display.filter(r => r.some(c => String(c).startsWith('⚠')));
+  }
   if (LIMIT > 0 && display.length > LIMIT) {
     display = display.slice(0, LIMIT);
   }
@@ -1015,6 +1057,17 @@ function escapeHtml(s) {
 function escapeAttr(s) { return escapeHtml(s).replace(/"/g, '&quot;'); }
 
 function showLoading(on) { $('#loading').style.display = on ? 'flex' : 'none'; }
+function scanProgress(name) {
+  const el = $('#scan-status');
+  const cur = el.textContent || '';
+  const parts = cur.split(' ').filter(Boolean);
+  if (!parts.includes(name)) parts.push(name);
+  el.textContent = parts.join(' ');
+}
+function scanDone() {
+  $('#scan-status').textContent = '';
+}
+
 function setStatus(t, cls) {
   $('#status-text').textContent = t;
   const d = $('#dot-status');
@@ -1060,6 +1113,10 @@ const TAB_META = {
 
 // 启动
 window.addEventListener('DOMContentLoaded', async () => {
+  try {
+    const s = await window.getUIState('');
+    UI_STATE = JSON.parse(s || '{}');
+  } catch (e) { UI_STATE = {}; }
   try {
     const info = await window.sysinfo('');
     $('#admin-status').textContent = info.admin;
